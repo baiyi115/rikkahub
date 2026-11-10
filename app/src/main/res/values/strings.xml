@@ -1297,8 +1297,10 @@
   <string name="setting_update_reminder_enabled">Update reminders are enabled</string>
   <string name="setting_update_reminder_paused_until">Paused until %1$s</string>
   <string name="setting_update_reminder_pause_title">Pause update reminders</string>
-  <string name="setting_update_reminder_pause_description">Choose how long to pause update reminders. They will resume automatically.</string>
+  <string name="setting_update_reminder_pause_description">Choose how long to pause update reminders. They will resume automatically, or choose Never to keep them off.</string>
   <string name="setting_update_reminder_pause_days">%1$d days</string>
+  <string name="setting_update_reminder_never">Never</string>
+  <string name="setting_update_reminder_disabled">Update reminders are off</string>
   <string name="setting_update_reminder_resume_now">Resume now</string>
   <string name="backup_page_import_overwrite_confirm">Importing a backup will overwrite app data. Continue?</string>
   <string name="setting_provider_page_test_non_streaming">Non-streaming</string>
@@ -1856,4 +1858,9 @@
   <string name="chat_message_tool_phone_use_open_app_name">Open app: %1$s</string>
   <string name="chat_message_tool_phone_use_list_apps">List apps</string>
   <string name="chat_message_tool_phone_use_wait">Wait %1$s seconds</string>
+  <string name="assistant_page_local_tools_local_shell_title">Local Shell</string>
+  <string name="assistant_page_local_tools_local_shell_desc">Run shell commands on this Android device instead of the Linux sandbox</string>
+  <string name="assistant_page_local_tools_local_shell_root_title">Run as root</string>
+  <string name="assistant_page_local_tools_local_shell_root_desc">Execute commands through su when it is granted. Only works on rooted devices.</string>
+  <string name="assistant_page_local_tools_local_shell_root_unavailable">su was not found on this device</string>
 </resources>

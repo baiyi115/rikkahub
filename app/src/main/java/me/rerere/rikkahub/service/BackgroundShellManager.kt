@@ -20,6 +20,8 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.ai.tools.local.LOCAL_SHELL_WORKSPACE_ID
+import me.rerere.rikkahub.data.ai.tools.local.LocalShellRunner
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.workspace.WorkspaceBackgroundCommand
 import java.util.concurrent.ConcurrentHashMap
@@ -142,12 +144,63 @@ class BackgroundShellManager(
         command: String,
         cwd: String,
     ): BackgroundShellTask {
-        val running = tasksOf(conversationId).count { it.status == BackgroundShellStatus.RUNNING }
-        require(running < MAX_RUNNING_PER_CONVERSATION) {
-            "$running background commands are already running. Wait for one to finish or stop one with workspace_shell_kill."
-        }
+        requireCapacity(conversationId)
         val id = newId()
         val backgroundCommand = workspaceRepository.startBackgroundCommand(workspaceId, command, cwd, id)
+        return register(conversationId, workspaceId, command, id, backgroundCommand)
+    }
+
+    suspend fun startLocal(
+        conversationId: Uuid,
+        runner: LocalShellRunner,
+        command: String,
+        cwd: String?,
+        root: Boolean,
+    ): BackgroundShellTask {
+        requireCapacity(conversationId)
+        val id = newId()
+        val backgroundCommand = withContext(Dispatchers.IO) {
+            runner.startBackgroundCommand(command, cwd, root, id)
+        }
+        return register(conversationId, LOCAL_SHELL_WORKSPACE_ID, command, id, backgroundCommand)
+    }
+
+    /** 读取上次之后的新输出; [waitMillis] 大于 0 时先等待命令结束, 超时后照常返回 */
+    suspend fun readOutput(
+        conversationId: Uuid,
+        id: String,
+        waitMillis: Long = 0,
+        maxBytes: Int = MAX_OUTPUT_BYTES,
+    ): BackgroundShellOutput {
+        val handle = requireHandle(conversationId, id)
+        if (waitMillis > 0) {
+            withTimeoutOrNull(waitMillis) { handle.exited.await() }
+        }
+        return readMutex.withLock {
+            // 先取状态再读日志: 状态已是结束时, 读到的就是全部输出
+            val finished = handle.exited.isCompleted
+            val limit = maxBytes.coerceIn(1, MAX_OUTPUT_BYTES * 4)
+            val (output, skipped) = withContext(Dispatchers.IO) { readNewOutput(handle, finished, limit) }
+            // 模型已经读到了全部输出, 结束通知就不用再发了
+            if (finished) withdrawNotice(conversationId, id)
+            BackgroundShellOutput(requireTask(conversationId, id), output, skipped)
+        }
+    }
+
+    private fun requireCapacity(conversationId: Uuid) {
+        val running = tasksOf(conversationId).count { it.status == BackgroundShellStatus.RUNNING }
+        require(running < MAX_RUNNING_PER_CONVERSATION) {
+            "$running background commands are already running. Wait for one to finish or stop one first."
+        }
+    }
+
+    private fun register(
+        conversationId: Uuid,
+        workspaceId: String,
+        command: String,
+        id: String,
+        backgroundCommand: WorkspaceBackgroundCommand,
+    ): BackgroundShellTask {
         val task = BackgroundShellTask(
             id = id,
             conversationId = conversationId,
@@ -172,22 +225,6 @@ class BackgroundShellManager(
         }
         Log.i(TAG, "start: $id, conversation=$conversationId, workspace=$workspaceId")
         return task
-    }
-
-    /** 读取上次之后的新输出; [waitMillis] 大于 0 时先等待命令结束, 超时后照常返回 */
-    suspend fun readOutput(conversationId: Uuid, id: String, waitMillis: Long = 0): BackgroundShellOutput {
-        val handle = requireHandle(conversationId, id)
-        if (waitMillis > 0) {
-            withTimeoutOrNull(waitMillis) { handle.exited.await() }
-        }
-        return readMutex.withLock {
-            // 先取状态再读日志: 状态已是结束时, 读到的就是全部输出
-            val finished = handle.exited.isCompleted
-            val (output, skipped) = withContext(Dispatchers.IO) { readNewOutput(handle, finished) }
-            // 模型已经读到了全部输出, 结束通知就不用再发了
-            if (finished) withdrawNotice(conversationId, id)
-            BackgroundShellOutput(requireTask(conversationId, id), output, skipped)
-        }
     }
 
     suspend fun kill(conversationId: Uuid, id: String): BackgroundShellTask {
@@ -282,11 +319,11 @@ class BackgroundShellManager(
         BackgroundShellForegroundService.release(context, id)
     }
 
-    private fun readNewOutput(handle: Handle, finished: Boolean): Pair<String, Long> {
+    private fun readNewOutput(handle: Handle, finished: Boolean, maxBytes: Int): Pair<String, Long> {
         val size = handle.command.outputSize()
         // 日志被删掉或截断时从头读
         val offset = handle.readOffset.takeIf { it <= size } ?: 0L
-        val skipped = (size - offset - MAX_OUTPUT_BYTES).coerceAtLeast(0)
+        val skipped = (size - offset - maxBytes).coerceAtLeast(0)
         val bytes = handle.command.readOutput(offset + skipped, (size - offset - skipped).toInt())
         // 运行中的命令可能刚写了半个字符, 留到下次读取; 已结束的不会再有后续字节
         val length = if (finished) bytes.size else bytes.completeUtf8Length()

@@ -66,10 +66,11 @@ const val MAX_OUTPUT_CHARS = 128 * 1024
 fun Process.readResult(
     timeoutMillis: Long,
     stdin: ByteArray? = null,
+    maxChars: Int = MAX_OUTPUT_CHARS,
     terminate: Process.() -> Unit = { destroyForcibly() },
 ): WorkspaceCommandResult {
-    val stdout = StreamCollector(inputStream)
-    val stderr = StreamCollector(errorStream)
+    val stdout = StreamCollector(inputStream, maxChars)
+    val stderr = StreamCollector(errorStream, maxChars)
     val stdinWriter = stdin?.let { bytes -> StreamWriter(outputStream, bytes) }
     if (stdinWriter == null) {
         // 没有 stdin 输入时立即关闭管道, 让子进程读到 EOF;

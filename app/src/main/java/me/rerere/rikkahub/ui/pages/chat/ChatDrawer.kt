@@ -173,6 +173,10 @@ fun ChatDrawerContent(
         mutableStateOf(updateCheckDisabledUntil <= System.currentTimeMillis())
     }
     LaunchedEffect(updateCheckDisabledUntil) {
+        if (updateCheckDisabledUntil == Long.MAX_VALUE) {
+            updateChecksEnabled = false
+            return@LaunchedEffect
+        }
         while (true) {
             val remaining = updateCheckDisabledUntil - System.currentTimeMillis()
             if (remaining <= 0) {

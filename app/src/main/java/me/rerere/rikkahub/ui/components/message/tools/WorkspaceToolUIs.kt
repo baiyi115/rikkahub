@@ -315,7 +315,11 @@ object ShellToolUI : ToolUIRenderer {
     override fun Summary(context: ToolUIContext) {
         val content = context.content ?: return
         val combined = remember(content) {
-            listOf(content.getStringContent("stdout"), content.getStringContent("stderr"))
+            listOf(
+                content.getStringContent("stdout"),
+                content.getStringContent("stderr"),
+                content.getStringContent("error"),
+            )
                 .filterNot { it.isNullOrBlank() }
                 .joinToString("\n")
                 .trim()

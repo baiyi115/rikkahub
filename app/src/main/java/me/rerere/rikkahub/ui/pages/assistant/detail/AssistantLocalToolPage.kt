@@ -16,7 +16,11 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -26,11 +30,13 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import me.rerere.ui.toast.ToastType
 import me.rerere.hugeicons.HugeIcons
+import me.rerere.hugeicons.stroke.Bash
 import me.rerere.hugeicons.stroke.Calendar03
 import me.rerere.hugeicons.stroke.ChartLineData01
 import me.rerere.hugeicons.stroke.ClipboardPaste
 import me.rerere.hugeicons.stroke.Clock01
 import me.rerere.hugeicons.stroke.JavaScript
+import me.rerere.hugeicons.stroke.Key01
 import me.rerere.hugeicons.stroke.MessageQuestion
 import me.rerere.hugeicons.stroke.SmartPhone01
 import me.rerere.hugeicons.stroke.Tap01
@@ -38,6 +44,7 @@ import me.rerere.hugeicons.stroke.VolumeHigh
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.Screen
 import me.rerere.rikkahub.data.datastore.SettingsStore
+import me.rerere.rikkahub.data.ai.tools.local.LocalShellRuntime
 import me.rerere.rikkahub.data.ai.tools.local.LocalToolOption
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.phoneuse.PhoneUseManager
@@ -111,6 +118,12 @@ private fun AssistantLocalToolContent(
     val floatingWindowRequiredText =
         stringResource(R.string.assistant_page_local_tools_phone_use_floating_window_required)
     val enableServiceText = stringResource(R.string.assistant_page_local_tools_phone_use_enable_service)
+
+    var rootAvailable by remember { mutableStateOf(LocalShellRuntime.isRootAvailable) }
+    LaunchedEffect(Unit) {
+        LocalShellRuntime.refresh()
+        rootAvailable = LocalShellRuntime.isRootAvailable
+    }
 
     val calendarPermissionState = rememberPermissionState(
         permissions = setOf(
@@ -262,6 +275,49 @@ private fun AssistantLocalToolContent(
                 title = R.string.assistant_page_local_tools_chart_display_title,
                 description = R.string.assistant_page_local_tools_chart_display_desc,
             )
+            toolItem(
+                option = LocalToolOption.LocalShell,
+                icon = HugeIcons.Bash,
+                title = R.string.assistant_page_local_tools_local_shell_title,
+                description = R.string.assistant_page_local_tools_local_shell_desc,
+            )
+            if (LocalToolOption.LocalShell in assistant.localTools) {
+                val useRoot = assistant.localShellUseRoot
+                switchItem(
+                    checked = useRoot,
+                    onCheckedChange = { onUpdate(assistant.copy(localShellUseRoot = it)) },
+                    leadingContent = {
+                        CardGroupIcon(
+                            icon = HugeIcons.Key01,
+                            containerColor = if (useRoot) {
+                                MaterialTheme.colorScheme.primaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.surfaceContainerHigh
+                            },
+                            contentColor = if (useRoot) {
+                                MaterialTheme.colorScheme.onPrimaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                    },
+                    supportingContent = {
+                        Column {
+                            Text(stringResource(R.string.assistant_page_local_tools_local_shell_root_desc))
+                            // 没有 su 时开关仍可打开, 但命令会以 App 身份执行, 在这里提前说明
+                            if (!rootAvailable) {
+                                Text(
+                                    text = stringResource(R.string.assistant_page_local_tools_local_shell_root_unavailable),
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                        }
+                    },
+                    headlineContent = {
+                        Text(stringResource(R.string.assistant_page_local_tools_local_shell_root_title))
+                    },
+                )
+            }
             // 只有 github 渠道的 Android 11 及以上才有
             if (PhoneUseManager.isSupported) {
                 toolItem(

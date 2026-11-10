@@ -41,6 +41,8 @@ data class Assistant(
     val customBodies: List<CustomBody> = emptyList(),
     val mcpServers: Set<Uuid> = emptySet(),
     val localTools: List<LocalToolOption> = listOf(LocalToolOption.TimeInfo),
+    // 本机 Shell 工具默认使用的身份; 仅在设备有 su 且用户授权后才会以 root 执行
+    val localShellUseRoot: Boolean = false,
     val enableWebSearch: Boolean = false, // 网络搜索开关(每个助手独立)
     val workspaceId: Uuid? = null,
     val background: String? = null, // 聊天页背景图地址(本地文件 URI 或网络 URL), 为 null 时无背景

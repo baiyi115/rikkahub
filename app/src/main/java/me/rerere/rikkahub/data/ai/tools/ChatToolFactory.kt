@@ -8,6 +8,7 @@ import me.rerere.ai.provider.BuiltInTools
 import me.rerere.ai.provider.Model
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.ai.mcp.McpManager
+import me.rerere.rikkahub.data.ai.tools.local.LocalToolOption
 import me.rerere.rikkahub.data.ai.tools.local.LocalTools
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.files.FileFolders
@@ -63,7 +64,14 @@ class ChatToolFactory(
             if (shouldUseExternalWebSearch(assistant, model)) {
                 addAll(createSearchTools(settings))
             }
-            addAll(localTools.getTools(assistant.localTools))
+            addAll(
+                localTools.getTools(
+                    options = assistant.localTools,
+                    conversationId = conversationId,
+                    backgroundShellManager = backgroundShellManager,
+                    localShellUseRoot = assistant.localShellUseRoot,
+                )
+            )
             if (assistant.enableRecentChatsReference) {
                 addAll(createConversationTools(conversationRepository, assistant.id))
             }
@@ -97,20 +105,22 @@ class ChatToolFactory(
                 )
             }
         }
-        // 过长的输出存成文件让模型用 shell 按需读取；没有 shell 时模型读不到文件，只能原样返回。
-        // 文件放在本机, 只有本地 Rootfs 挂载了 /tool_outputs, 远程工作区同样读不到
-        val canReadToolOutputs = workspaceTools.isNotEmpty() &&
-            assistant.workspaceId?.let { workspaceRepository.getById(it.toString()) }?.capabilities()?.rootfs == true
-        return if (canReadToolOutputs) tools.map(::withOutputTruncation) else tools
+        // 过长的输出存成文件让模型用 shell 按需读取；没有 shell 时模型读不到文件，只能原样返回
+        val localShellEnabled = LocalToolOption.LocalShell in assistant.localTools
+        val canReadToolOutputs = localShellEnabled ||
+            (workspaceTools.isNotEmpty() &&
+                assistant.workspaceId?.let { workspaceRepository.getById(it.toString()) }?.capabilities()?.rootfs ==
+                true)
+        return if (canReadToolOutputs) tools.map { withOutputTruncation(it, localShellEnabled) } else tools
     }
 
-    private fun withOutputTruncation(tool: Tool): Tool {
+    private fun withOutputTruncation(tool: Tool, includeHostPath: Boolean): Tool {
         if (tool.name in TOOLS_WITHOUT_OUTPUT_TRUNCATION) return tool
         val execute = tool.execute
-        return tool.copy(execute = { truncateOutput(execute(it)) })
+        return tool.copy(execute = { truncateOutput(execute(it), includeHostPath) })
     }
 
-    private fun truncateOutput(output: List<UIMessagePart>): List<UIMessagePart> {
+    private fun truncateOutput(output: List<UIMessagePart>, includeHostPath: Boolean): List<UIMessagePart> {
         val textParts = output.filterIsInstance<UIMessagePart.Text>()
         val totalChars = textParts.sumOf { it.text.length }
         if (totalChars <= MAX_TOOL_OUTPUT_CHARS) return output
@@ -126,6 +136,9 @@ class ChatToolFactory(
                 buildString {
                     appendLine("[Tool output truncated: $totalChars characters total]")
                     appendLine("Full output saved to: /tool_outputs/$fileName")
+                    if (includeHostPath) {
+                        appendLine("Local shell path: ${File(outputDir, fileName).absolutePath}")
+                    }
                     appendLine("Use shell to read: `cat /tool_outputs/$fileName`")
                     appendLine("Use shell to search: `grep \"pattern\" /tool_outputs/$fileName`")
                     appendLine()

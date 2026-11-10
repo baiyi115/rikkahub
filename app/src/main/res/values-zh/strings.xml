@@ -1277,8 +1277,10 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="setting_update_reminder_enabled">更新提醒已启用</string>
   <string name="setting_update_reminder_paused_until">已暂停至 %1$s</string>
   <string name="setting_update_reminder_pause_title">暂停更新提醒</string>
-  <string name="setting_update_reminder_pause_description">选择暂停更新提醒的时长。它们会自动恢复。</string>
+  <string name="setting_update_reminder_pause_description">选择暂停更新提醒的时长。到期会自动恢复；选择“永不”则一直关闭，直到手动恢复。</string>
   <string name="setting_update_reminder_pause_days">%1$d 天</string>
+  <string name="setting_update_reminder_never">永不</string>
+  <string name="setting_update_reminder_disabled">更新提醒已关闭</string>
   <string name="setting_update_reminder_resume_now">立即恢复</string>
   <string name="reasoning_max">最大</string>
   <string name="backup_page_import_overwrite_confirm">导入备份会覆盖 App 数据，是否继续</string>
@@ -1858,4 +1860,9 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="chat_message_tool_phone_use_open_app_name">打开应用：%1$s</string>
   <string name="chat_message_tool_phone_use_list_apps">列出应用</string>
   <string name="chat_message_tool_phone_use_wait">等待 %1$s 秒</string>
+  <string name="assistant_page_local_tools_local_shell_title">本机 Shell</string>
+  <string name="assistant_page_local_tools_local_shell_desc">直接在此 Android 设备上执行 Shell 命令，而不是 Linux 沙箱</string>
+  <string name="assistant_page_local_tools_local_shell_root_title">以 root 运行</string>
+  <string name="assistant_page_local_tools_local_shell_root_desc">在已授权时通过 su 执行命令，仅适用于已 Root 的设备。</string>
+  <string name="assistant_page_local_tools_local_shell_root_unavailable">未在此设备上找到 su</string>
 </resources>

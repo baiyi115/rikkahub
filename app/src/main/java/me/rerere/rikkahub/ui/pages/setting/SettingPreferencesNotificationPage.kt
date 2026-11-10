@@ -49,7 +49,8 @@ import me.rerere.rikkahub.utils.plus
 import me.rerere.rikkahub.utils.toLocalDateTime
 import org.koin.androidx.compose.koinViewModel
 
-private val UPDATE_PAUSE_DAY_OPTIONS = listOf(7, 14, 21)
+private const val UPDATE_PAUSE_NEVER = 0
+private val UPDATE_PAUSE_DAY_OPTIONS = listOf(7, 14, 21, UPDATE_PAUSE_NEVER)
 private const val MILLIS_PER_DAY = 24 * 60 * 60 * 1_000L
 
 @Composable
@@ -121,14 +122,16 @@ fun SettingPreferencesNotificationPage(vm: SettingVM = koinViewModel()) {
                             },
                             headlineContent = { Text(stringResource(R.string.setting_display_page_show_updates_title)) },
                             supportingContent = {
+                                val disabledUntil = displaySetting.updateCheckDisabledUntilEpochMillis
                                 Text(
-                                    if (updateChecksEnabled) {
-                                        stringResource(R.string.setting_update_reminder_enabled)
-                                    } else {
-                                        stringResource(
+                                    when {
+                                        updateChecksEnabled -> stringResource(R.string.setting_update_reminder_enabled)
+                                        disabledUntil == Long.MAX_VALUE ->
+                                            stringResource(R.string.setting_update_reminder_disabled)
+
+                                        else -> stringResource(
                                             R.string.setting_update_reminder_paused_until,
-                                            Instant.ofEpochMilli(displaySetting.updateCheckDisabledUntilEpochMillis)
-                                                .toLocalDateTime(),
+                                            Instant.ofEpochMilli(disabledUntil).toLocalDateTime(),
                                         )
                                     }
                                 )
@@ -206,7 +209,11 @@ fun SettingPreferencesNotificationPage(vm: SettingVM = koinViewModel()) {
                         containerColor = MaterialTheme.colorScheme.surfaceBright,
                     ) { days, selected ->
                         ConnectedChoiceLabel(
-                            text = stringResource(R.string.setting_update_reminder_pause_days, days),
+                            text = if (days == UPDATE_PAUSE_NEVER) {
+                                stringResource(R.string.setting_update_reminder_never)
+                            } else {
+                                stringResource(R.string.setting_update_reminder_pause_days, days)
+                            },
                             selected = selected,
                         )
                     }
@@ -230,8 +237,11 @@ fun SettingPreferencesNotificationPage(vm: SettingVM = koinViewModel()) {
                     onClick = {
                         updateDisplaySetting(
                             displaySetting.copy(
-                                updateCheckDisabledUntilEpochMillis =
-                                    System.currentTimeMillis() + selectedUpdatePauseDays * MILLIS_PER_DAY,
+                                updateCheckDisabledUntilEpochMillis = if (selectedUpdatePauseDays == UPDATE_PAUSE_NEVER) {
+                                    Long.MAX_VALUE
+                                } else {
+                                    System.currentTimeMillis() + selectedUpdatePauseDays * MILLIS_PER_DAY
+                                },
                             )
                         )
                         showUpdatePauseDialog = false
