@@ -31,7 +31,8 @@ pnpm --dir web-ui install --frozen-lockfile
 ## GitHub Actions（手动触发）
 
 `.github/workflows/release.yml` 不监听 push，也没有任何输入项：在 Actions 页面点 “Run workflow” 即可。
-构建完成后在运行记录的 Artifacts 里下载 `rikkahub-github-release`，不需要创建或推送 tag。
+构建完成后在运行记录的 Artifacts 里分别下载 `rikkahub-github-arm64-v8a`、`rikkahub-github-x86_64`、
+`rikkahub-github-universal`（混淆映射在 `rikkahub-github-mapping`），不需要创建或推送 tag。
 `.github/workflows/daily-build.yml` 仍按计划每晚构建。两个工作流都需要以下仓库 Secret：
 
 | Secret | 内容 |
