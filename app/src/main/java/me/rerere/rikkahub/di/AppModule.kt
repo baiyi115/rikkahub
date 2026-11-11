@@ -154,6 +154,7 @@ val appModule = module {
             filesManager = get(),
             folderRepository = get(),
             backgroundShellManager = get(),
+            localTools = get(),
         )
     }
 

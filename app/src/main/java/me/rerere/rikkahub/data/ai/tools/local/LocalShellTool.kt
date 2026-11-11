@@ -15,6 +15,7 @@ import kotlinx.serialization.json.putJsonArray
 import me.rerere.ai.core.InputSchema
 import me.rerere.ai.core.Tool
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.rikkahub.data.ai.tools.putBackgroundShellTask
 import me.rerere.rikkahub.service.BackgroundShellManager
 import me.rerere.rikkahub.service.BackgroundShellOutput
 import me.rerere.rikkahub.service.BackgroundShellStatus
@@ -31,6 +32,7 @@ private const val MAX_JOB_WAIT_MS = 60_000L
 /** [defaultRoot] 仅在设备上存在 su 时生效, 模型仍可显式传 identity 覆盖 */
 fun buildLocalShellTool(
     runner: LocalShellRunner,
+    conversationId: Uuid,
     defaultRoot: Boolean,
     needsApproval: Boolean = true,
 ): Tool {
@@ -40,18 +42,21 @@ fun buildLocalShellTool(
         name = LOCAL_SHELL_TOOL_NAME,
         description = """
             Run shell commands on this Android device itself, not in the Linux workspace sandbox.
-            The shell is $SYSTEM_SHELL (mksh) with toybox utilities; bash, apt, Python or Node are not available unless
+            The shell is $SYSTEM_SHELL (mksh) with toybox utilities; setsid is required for safe process isolation.
+            bash, apt, Python or Node are not available unless
             installed separately, and the app usually cannot read arbitrary /sdcard paths without storage permission.
             Default working directory: $defaultCwd. cwd may be absolute or relative to it.
             Default identity: $defaultIdentity. With root (su), commands can use pm, am, dumpsys, settings, appops and
             read protected files; the first root command may show a system superuser authorization dialog.
             For shell state across commands, call action=open first, then pass session_id to action=exec; cd, environment
-            variables and shell variables persist. action=close closes a session and action=list shows open sessions.
+            variables and shell variables persist. action=close closes a session and action=list shows this chat's sessions.
             Each exec without session_id runs in a fresh shell; background processes left with & are killed when the
             command returns. Session commands read stdin from /dev/null, so use pipes or heredocs for input; a command
-            that exceeds the timeout closes the whole session.
+            that times out or is cancelled closes the whole session. Descriptor 3 is reserved for the control protocol;
+            do not close or redirect it. exec that replaces the shell and exit end the session.
             Use local_shell_job for long-running or background commands.
-            Output is capped at 32 KiB per stream; redirect large output to a file and read it in pieces.
+            Output is capped at 32768 characters per stream (merged stdout/stderr in sessions).
+            Excess output is discarded; redirect large output to a file and read it in pieces.
             Returns JSON with exitCode, stdout, stderr, timedOut and truncated.
         """.trimIndent().replace("\n", " "),
         parameters = {
@@ -69,7 +74,7 @@ fun buildLocalShellTool(
                         put(
                             "description",
                             "exec (default) runs a command; open creates a persistent shell; close closes one; " +
-                                "list shows sessions; check_root runs su to test and update root authorization."
+                                "list shows this chat's sessions; check_root runs su to test current root authorization."
                         )
                     })
                     put("command", buildJsonObject {
@@ -118,7 +123,7 @@ fun buildLocalShellTool(
             }
         },
         execute = { input ->
-            executeLocalShellTool(runner, input.jsonObject, defaultIdentity)
+            executeLocalShellTool(runner, conversationId, input.jsonObject, defaultIdentity)
         },
     )
 }
@@ -140,6 +145,8 @@ fun buildLocalShellJobTool(
             Logs are written to a file and output_path is returned, so use local_shell to read the full log if the
             preview is truncated. action=list shows jobs, read returns new output, wait blocks until the job finishes
             or wait_ms elapses, and stop terminates the job with its child processes.
+            When the command shell exits, remaining processes in its group are killed before completion is reported.
+            Do not daemonize or detach with setsid; detached daemons and recovery after app restart are not supported.
             The command runs in its own shell and does not inherit local_shell session state.
             Use this for dev servers, builds, downloads and other long-running commands instead of a foreground exec.
         """.trimIndent().replace("\n", " "),
@@ -208,6 +215,7 @@ fun buildLocalShellJobTool(
 
 private suspend fun executeLocalShellTool(
     runner: LocalShellRunner,
+    conversationId: Uuid,
     params: JsonObject,
     defaultIdentity: String,
 ): List<UIMessagePart> {
@@ -215,20 +223,13 @@ private suspend fun executeLocalShellTool(
     val identity = params.resolveIdentity(defaultIdentity) ?: return localShellError(
         "identity must be 'user' or 'root'"
     )
-    if (identity == "root" && !LocalShellRuntime.isRootAvailable) {
-        return localShellError(
-            "Root is not available on this device: su was not found. Disable 'Run as root' or use identity=user."
-        )
-    }
     val timeoutSeconds = params.longValue("timeout")?.coerceIn(1L, MAX_TIMEOUT_SECONDS)
         ?: DEFAULT_TIMEOUT_SECONDS
     return try {
         when (action) {
-            "exec" -> execInLocalShell(runner, params, identity, timeoutSeconds * 1_000L)
+            "exec" -> execInLocalShell(runner, conversationId, params, identity, timeoutSeconds * 1_000L)
             "open" -> {
-                val session = withContext(Dispatchers.IO) {
-                    runner.openSession(root = identity == "root", cwd = params.stringValue("cwd"))
-                }
+                val session = runner.openSession(conversationId, root = identity == "root", cwd = params.stringValue("cwd"))
                 listOf(
                     UIMessagePart.Text(
                         buildJsonObject {
@@ -247,7 +248,7 @@ private suspend fun executeLocalShellTool(
                 if (sessionId.isNullOrBlank()) {
                     localShellError("session_id is required for action=close")
                 } else {
-                    val closed = runner.closeSession(sessionId)
+                    val closed = withContext(Dispatchers.IO) { runner.closeSession(conversationId, sessionId) }
                     listOf(
                         UIMessagePart.Text(
                             buildJsonObject {
@@ -268,7 +269,7 @@ private suspend fun executeLocalShellTool(
                         put("ok", true)
                         put("action", "list")
                         putJsonArray("sessions") {
-                            runner.listSessions().forEach { session ->
+                            runner.listSessions(conversationId).forEach { session ->
                                 addJsonObject {
                                     put("session_id", session.id)
                                     put("identity", session.identity)
@@ -293,6 +294,7 @@ private suspend fun executeLocalShellTool(
 
 private suspend fun execInLocalShell(
     runner: LocalShellRunner,
+    conversationId: Uuid,
     params: JsonObject,
     identity: String,
     timeoutMillis: Long,
@@ -303,15 +305,14 @@ private suspend fun execInLocalShell(
     val cwd = params.stringValue("cwd")
 
     if (!sessionId.isNullOrBlank()) {
-        val session = runner.findSession(sessionId)
+        val session = runner.findSession(conversationId, sessionId)
             ?: return localShellError("Session not found or already closed: $sessionId")
         if (params.stringValue("identity") != null && identity != session.identity) {
             return localShellError(
                 "Session $sessionId runs as ${session.identity}; open a new session for identity=$identity"
             )
         }
-        val result = withContext(Dispatchers.IO) { session.exec(command, cwd, timeoutMillis) }
-        if (result.sessionClosed) runner.closeSession(sessionId)
+        val result = runner.executeSession(conversationId, sessionId, command, cwd, timeoutMillis)
         return listOf(
             UIMessagePart.Text(
                 buildJsonObject {
@@ -395,11 +396,6 @@ private suspend fun executeLocalShellJobTool(
     val identity = params.resolveIdentity(defaultIdentity) ?: return localShellError(
         "identity must be 'user' or 'root'"
     )
-    if (identity == "root" && !LocalShellRuntime.isRootAvailable) {
-        return localShellError(
-            "Root is not available on this device: su was not found. Disable 'Run as root' or use identity=user."
-        )
-    }
     return try {
         when (action) {
             "start" -> {
@@ -491,11 +487,9 @@ private fun BackgroundShellTask.toJobJson(
 }
 
 private fun BackgroundShellTask.writeJobFields(builder: kotlinx.serialization.json.JsonObjectBuilder) {
+    builder.putBackgroundShellTask(this)
     builder.put("job_id", id)
-    builder.put("taskId", id)
     builder.put("command", command)
-    builder.put("status", status.name.lowercase())
-    exitCode?.let { builder.put("exitCode", it) }
     builder.put("startedAt", startedAt)
     endedAt?.let { builder.put("endedAt", it) }
     builder.put("output_path", logPath)

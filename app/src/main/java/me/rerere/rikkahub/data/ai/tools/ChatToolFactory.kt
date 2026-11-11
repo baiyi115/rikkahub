@@ -140,8 +140,16 @@ class ChatToolFactory(
                     if (includeHostPath) {
                         appendLine("Local shell path: ${File(outputDir, fileName).absolutePath}")
                     }
-                    appendLine("Use shell to read: `cat /tool_outputs/$fileName`")
-                    appendLine("Use shell to search: `grep \"pattern\" /tool_outputs/$fileName`")
+                    val shellPath = if (includeHostPath) {
+                        File(
+                            outputDir,
+                            fileName
+                        ).absolutePath
+                    } else {
+                        "/tool_outputs/$fileName"
+                    }
+                    appendLine("Use shell to read: `cat '$shellPath'`")
+                    appendLine("Use shell to search: `grep \"pattern\" '$shellPath'`")
                     appendLine()
                     append(fullText.take(TOOL_OUTPUT_PREVIEW_CHARS))
                 }

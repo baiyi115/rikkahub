@@ -49,6 +49,7 @@ import me.rerere.rikkahub.data.ai.TranslationHandler
 import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.ai.prompts.buildCompressPrompt
 import me.rerere.rikkahub.data.ai.tools.InvalidMcpServerNamesException
+import me.rerere.rikkahub.data.ai.tools.local.LocalTools
 import me.rerere.rikkahub.data.ai.tools.shouldUseExternalWebSearch
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
@@ -120,6 +121,7 @@ class ChatService(
     private val filesManager: FilesManager,
     private val folderRepository: FolderRepository,
     private val backgroundShellManager: BackgroundShellManager,
+    private val localTools: LocalTools,
 ) {
     /** 一次 agent 运行发给模型的消息，和回复要写进的节点 */
     private class ReplyTarget(val history: List<UIMessage>, val nodeId: Uuid) {
@@ -1359,6 +1361,7 @@ class ChatService(
         val session = sessionManager.getOrCreate(conversationId)
         discardQueuedMessages(session)
         session.replace(newConversation(conversationId), existsInDatabase = false) { previous ->
+            localTools.closeShellSessions(conversationId)
             conversationRepo.getConversationById(conversationId)?.let { conversationRepo.deleteConversation(it) }
             // 数据库那份不知道只在内存里出现过的附件
             previous?.let { filesManager.deleteChatFiles(it.files) }

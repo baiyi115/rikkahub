@@ -1,281 +1,218 @@
 package me.rerere.rikkahub.data.ai.tools.local
 
 import android.content.Context
-import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runInterruptible
+import me.rerere.workspace.BackgroundCommandLog
 import me.rerere.workspace.WorkspaceBackgroundCommand
 import me.rerere.workspace.readResult
-import java.io.BufferedWriter
 import java.io.File
-import java.io.IOException
-import java.io.OutputStreamWriter
-import java.io.RandomAccessFile
-import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.thread
-import kotlin.concurrent.withLock
+import kotlin.uuid.Uuid
 
-private const val TAG = "LocalShellRunner"
-
-/** 同时保留的持久 shell 会话上限 */
-private const val MAX_SESSIONS = 4
-
-/** 会话 shell 打开后等待环境初始化的时间; 首次 root 授权可能较慢 */
+private const val MAX_SESSIONS_PER_CONVERSATION = 4
+private const val MAX_SESSIONS = 16
 private const val SESSION_SETUP_TIMEOUT_MS = 30_000L
 
-/** 会话输出在两次读取之间的缓冲上限, 防止后台命令刷屏占满内存 */
-private const val MAX_BUFFERED_LINES = 4_096
-
-/** 后台任务在工作区里的归属标记, 复用了工作区后台任务的基础设施 */
 const val LOCAL_SHELL_WORKSPACE_ID = "local_shell"
 
-/**
- * 在本机执行 shell: 一次性命令、带 cwd/环境持久化的会话, 以及写日志的后台任务。
- * 身份为 App 自身 UID 或经 su 获得的 root, 不使用 PRoot Rootfs。
- */
-class LocalShellRunner(context: Context) {
-    private val appContext = context.applicationContext
+/** Android host execution; the file-based constructor also allows JVM process regression tests. */
+class LocalShellRunner internal constructor(
+    filesDir: File,
+    cacheDir: File,
+    private val shell: String = SYSTEM_SHELL,
+    private val setsid: String = SETSID,
+    private val searchPath: String = DEFAULT_PATH,
+    private val suPath: () -> String? = LocalShellRuntime::suPath,
+) {
+    constructor(context: Context) : this(context.applicationContext.filesDir, context.applicationContext.cacheDir)
 
-    val defaultCwd: File = File(appContext.filesDir, LOCAL_SHELL_DIR).apply { mkdirs() }
-
-    private val tempDir: File = File(appContext.cacheDir, LOCAL_SHELL_TMP_DIR).apply { mkdirs() }
-
-    private val jobsDir: File = File(defaultCwd, LOCAL_SHELL_JOBS_DIR).apply { mkdirs() }
-
+    val defaultCwd = File(filesDir, LOCAL_SHELL_DIR).apply { mkdirs() }
+    private val tempDir = File(cacheDir, LOCAL_SHELL_TMP_DIR).apply { mkdirs() }
+    private val jobsDir = File(defaultCwd, LOCAL_SHELL_JOBS_DIR).apply { mkdirs() }
     private val sessions = LinkedHashMap<String, LocalShellSession>()
     private val sessionsLock = Any()
 
-    suspend fun execute(
-        command: String,
-        cwd: String?,
-        timeoutMillis: Long,
-        root: Boolean,
-    ): LocalShellResult = runInterruptible(Dispatchers.IO) {
-        executeOneShot(command, cwd, timeoutMillis, root)
+    suspend fun execute(command: String, cwd: String?, timeoutMillis: Long, root: Boolean): LocalShellResult =
+        runInterruptible(Dispatchers.IO) { executeOneShot(command, cwd, timeoutMillis, root) }
+
+    suspend fun openSession(conversationId: Uuid, root: Boolean, cwd: String? = null): LocalShellSession {
+        var opened: LocalShellSession? = null
+        try {
+            return runInterruptible(Dispatchers.IO) {
+                createSession(conversationId, root, cwd).also { opened = it }
+            }
+        } catch (e: CancellationException) {
+            opened?.let { closeSession(conversationId, it.id) }
+            throw e
+        }
     }
 
-    /** 打开持久 shell; [cwd] 省略时使用 [defaultCwd] */
-    fun openSession(root: Boolean, cwd: String? = null): LocalShellSession {
-        if (root &&
-            !LocalShellRuntime.isRootAvailable) {
-            error("Root is not available on this device: su was not found")
-        }
+    private fun createSession(conversationId: Uuid, root: Boolean, cwd: String?): LocalShellSession {
         val workingDir = resolveWorkingDir(cwd, requireExists = !root)
-        val id = "shell_" + UUID.randomUUID().toString().replace("-", "").take(8)
+        synchronized(sessionsLock) { requireSessionCapacity(conversationId) }
+        val id = "shell_${UUID.randomUUID().toString().replace("-", "")}"
         val pidFile = File(tempDir, "session-$id.pid")
-        val process = startSessionProcess(root)
         val session = LocalShellSession(
             id = id,
+            conversationId = conversationId,
             identity = if (root) "root" else "user",
-            process = process,
+            process = processBuilderFor(null, root, pidFile).redirectErrorStream(true).start(),
             pidFile = pidFile,
             runner = this,
             initialCwd = workingDir.absolutePath,
         )
         try {
-            session.writeRaw(
-                buildString {
-                    append("echo \$\$ > ").append(pidFile.absolutePath.shellQuote()).append(" 2>/dev/null\n")
-                    append(environmentExports())
-                    append("cd ").append(workingDir.absolutePath.shellQuote())
-                    append(" 2>/dev/null || echo __RIKKA_CWD_FAILED__\n")
+            synchronized(sessionsLock) {
+                val closed = sessions.values.filterNot { it.isAlive }
+                closed.forEach {
+                    sessions.remove(it.id)
+                    it.close()
                 }
+                requireSessionCapacity(conversationId)
+                sessions[id] = session
+            }
+            session.writeRaw(
+                "exec 3>&1\n${environmentExports()}\n"
             )
-            // 用一个无副作用的命令确认 shell 已经能处理输入; 首次 root 授权也在这段时间完成
-            val probe = session.exec(":", workingDir = null, timeoutMillis = SESSION_SETUP_TIMEOUT_MS)
-            if (probe.stdout.contains("__RIKKA_CWD_FAILED__")) {
-                error("Working directory does not exist or is not accessible: ${workingDir.absolutePath}")
+            val probe = session.exec(":", workingDir.absolutePath, SESSION_SETUP_TIMEOUT_MS)
+            check(!probe.timedOut && !probe.sessionClosed && probe.exitCode == 0 && session.isAlive) {
+                probe.stderr.ifBlank { "Shell session could not enter ${workingDir.absolutePath}" }
             }
-            if (probe.timedOut || probe.exitCode != 0) {
-                error(probe.stderr.ifBlank { "Shell session did not start (exit=${probe.exitCode})" })
-            }
+            return session
         } catch (e: Throwable) {
+            synchronized(sessionsLock) { sessions.remove(id) }
             session.close()
             throw e
         }
-        synchronized(sessionsLock) {
-            pruneClosedSessionsLocked()
-            if (sessions.size >= MAX_SESSIONS) {
-                session.close()
-                error("Too many shell sessions (max $MAX_SESSIONS). Close one with action=close first.")
-            }
-            sessions[id] = session
+    }
+
+    private fun requireSessionCapacity(conversationId: Uuid) {
+        check(sessions.values.count { it.isAlive } < MAX_SESSIONS) {
+            "Too many shell sessions on this device (max $MAX_SESSIONS)"
         }
-        return session
+        check(sessions.values.count { it.conversationId == conversationId && it.isAlive } < MAX_SESSIONS_PER_CONVERSATION) {
+            "Too many shell sessions in this conversation (max $MAX_SESSIONS_PER_CONVERSATION); close one first"
+        }
     }
 
-    fun findSession(id: String): LocalShellSession? = synchronized(sessionsLock) {
-        sessions[id]?.takeIf { it.isAlive }
+    fun findSession(conversationId: Uuid, id: String): LocalShellSession? = synchronized(sessionsLock) {
+        sessions[id]?.takeIf { it.conversationId == conversationId && it.isAlive }
     }
 
-    fun closeSession(id: String): Boolean {
-        val session = synchronized(sessionsLock) { sessions.remove(id) } ?: return false
+    suspend fun executeSession(
+        conversationId: Uuid,
+        id: String,
+        command: String,
+        cwd: String?,
+        timeoutMillis: Long,
+    ): LocalShellResult {
+        val session = findSession(conversationId, id) ?: error("Session not found or already closed: $id")
+        try {
+            return runInterruptible(Dispatchers.IO) { session.exec(command, cwd, timeoutMillis) }
+        } catch (e: CancellationException) {
+            closeSession(conversationId, id)
+            throw e
+        } finally {
+            if (!session.isAlive) closeSession(conversationId, id)
+        }
+    }
+
+    fun closeSession(conversationId: Uuid, id: String): Boolean {
+        val session = synchronized(sessionsLock) {
+            sessions[id]?.takeIf { it.conversationId == conversationId }?.also { sessions.remove(id) }
+        } ?: return false
         session.close()
         return true
     }
 
-    fun listSessions(): List<LocalShellSessionInfo> = synchronized(sessionsLock) {
-        pruneClosedSessionsLocked()
-        sessions.values.map { session ->
-            LocalShellSessionInfo(
-                id = session.id,
-                identity = session.identity,
-                cwd = session.cwd,
-                alive = session.isAlive,
-            )
+    fun closeConversation(conversationId: Uuid) {
+        val removed = synchronized(sessionsLock) {
+            sessions.values.filter { it.conversationId == conversationId }.also { list ->
+                list.forEach { sessions.remove(it.id) }
+            }
+        }
+        removed.forEach { it.close() }
+    }
+
+    fun listSessions(conversationId: Uuid): List<LocalShellSessionInfo> = synchronized(sessionsLock) {
+        sessions.values.filter { it.conversationId == conversationId && it.isAlive }.map {
+            LocalShellSessionInfo(it.id, it.identity, it.cwd, true)
         }
     }
 
-    fun closeAll() {
-        val current = synchronized(sessionsLock) {
-            sessions.values.toList().also { sessions.clear() }
-        }
-        current.forEach { runCatching { it.close() } }
-    }
-
-    /** 启动后台命令, stdout/stderr 合并写入日志; 调用方负责等待与终止 */
-    fun startBackgroundCommand(
-        command: String,
-        cwd: String?,
-        root: Boolean,
-        id: String,
-    ): WorkspaceBackgroundCommand {
-        if (root && !LocalShellRuntime.isRootAvailable) {
-            error("Root is not available on this device: su was not found")
-        }
+    fun startBackgroundCommand(command: String, cwd: String?, root: Boolean, id: String): WorkspaceBackgroundCommand {
         val workingDir = resolveWorkingDir(cwd, requireExists = !root)
-        val safeId = id.filter { it.isLetterOrDigit() || it == '-' || it == '_' }.ifBlank {
-            UUID.randomUUID().toString()
-        }
+        val safeId = id.filter {
+            it.isLetterOrDigit() || it == '-' || it == '_'
+        }.ifBlank { UUID.randomUUID().toString() }
         val logFile = File(jobsDir, "$safeId.log")
         val pidFile = File(tempDir, "job-$safeId.pid")
-        val wrapped = buildWrappedCommand(command, workingDir, pidFile)
-        val process = backgroundBuilder(wrapped, root)
+        val process = processBuilderFor(buildWrappedCommand(command, workingDir), root, pidFile)
             .redirectInput(File("/dev/null"))
             .redirectErrorStream(true)
             .redirectOutput(logFile)
             .start()
-        return LocalBackgroundCommand(
-            process = process,
-            logFile = logFile,
-            logPath = logFile.absolutePath,
-            pidFile = pidFile,
-            root = root,
-        )
+        return LocalBackgroundCommand(process, logFile, pidFile, root)
     }
 
     suspend fun checkRoot(timeoutMillis: Long = 15_000L): LocalShellResult =
         execute("id -u", cwd = null, timeoutMillis = timeoutMillis, root = true)
 
-    private fun executeOneShot(
-        command: String,
-        cwd: String?,
-        timeoutMillis: Long,
-        root: Boolean,
-    ): LocalShellResult {
-        if (root && !LocalShellRuntime.isRootAvailable) {
-            error("Root is not available on this device: su was not found")
-        }
+    private fun executeOneShot(command: String, cwd: String?, timeoutMillis: Long, root: Boolean): LocalShellResult {
         val workingDir = resolveWorkingDir(cwd, requireExists = !root)
         val pidFile = File(tempDir, "exec-${UUID.randomUUID()}.pid")
-        val wrapped = buildWrappedCommand(command, workingDir, pidFile)
-        val process = startOneShotProcess(wrapped, root)
+        val process = processBuilderFor(buildWrappedCommand(command, workingDir), root, pidFile).start()
         try {
             val result = process.readResult(
                 timeoutMillis = timeoutMillis,
+                onFinished = { terminateProcess(process, pidFile, root) },
                 terminate = { terminateProcess(this, pidFile, root) },
                 maxChars = MAX_OUTPUT_CHARS,
             )
-            // 命令结束后回收同组后台进程, 与 Agent 的一次性命令语义一致
-            if (!result.timedOut) killProcessGroup(pidFile, root)
-            return LocalShellResult(
-                exitCode = result.exitCode,
-                stdout = result.stdout,
-                stderr = result.stderr,
-                timedOut = result.timedOut,
-                truncated = result.truncated,
-            )
+            return LocalShellResult(result.exitCode, result.stdout, result.stderr, result.timedOut, result.truncated)
         } finally {
-            pidFile.delete()
+            terminateProcess(process, pidFile, root)
         }
     }
 
-    private fun startOneShotProcess(wrapped: String, root: Boolean): Process =
-        processBuilderFor(wrapped, root)
-            .redirectErrorStream(false)
-            .start()
-
-    private fun backgroundBuilder(wrapped: String, root: Boolean): ProcessBuilder =
-        processBuilderFor(wrapped, root)
-
-    private fun processBuilderFor(wrapped: String, root: Boolean): ProcessBuilder {
-        val setsidAvailable = File(SETSID).let { it.isFile && it.canExecute() }
-        return when {
-            // root: 在 su 里再 exec setsid, 让内层 shell 成为会话组长, pid 文件记录的就是组长 pid
-            root -> {
-                val inner = if (setsidAvailable) {
-                    "exec $SETSID $SYSTEM_SHELL -c ${wrapped.shellQuote()}"
-                } else {
-                    wrapped
-                }
-                ProcessBuilder(LocalShellRuntime.suPath() ?: error("su is not available"), "-c", inner)
-            }
-
-            setsidAvailable -> ProcessBuilder(SETSID, SYSTEM_SHELL, "-c", wrapped)
-            else -> ProcessBuilder(SYSTEM_SHELL, "-c", wrapped)
-        }.apply {
-            environment().putAll(baseEnvironment())
+    private fun processBuilderFor(command: String?, root: Boolean, pidFile: File): ProcessBuilder {
+        check(File(setsid).let { it.isFile && it.canExecute() }) {
+            "setsid is unavailable; safe shell process isolation is required"
         }
+        val body = "echo \$\$ > ${pidFile.absolutePath.shellQuote()}; " + (command ?: "exec ${shell.shellQuote()}")
+        val args = listOf(setsid, shell, "-c", body)
+        // Launch setsid as a non-job-controlled child so it cannot fork away from the process we wait for.
+        val launch = "set +m; exec 4<&0; " + args.joinToString(" ") { it.shellQuote() } +
+            " <&4 4<&- & wait \$!"
+        return if (root) {
+            val su = suPath() ?: error("Root is not available: su was not found")
+            val proxy = "echo user:\$\$ > ${pidFile.absolutePath.shellQuote()}; exec ${su.shellQuote()} -c ${launch.shellQuote()}"
+            ProcessBuilder(shell, "-c", proxy)
+        } else {
+            ProcessBuilder(shell, "-c", launch)
+        }.apply { environment().putAll(baseEnvironment()) }
     }
 
-    /** 统一工作目录、HOME、PATH 等环境; 命令里还会再 export 一次, 防止 su 重置环境 */
-    internal fun buildWrappedCommand(command: String, workingDir: File, pidFile: File): String = buildString {
-        append("echo \$\$ > ").append(pidFile.absolutePath.shellQuote()).append(" 2>/dev/null; ")
-        append(environmentExports())
-        append("cd ").append(workingDir.absolutePath.shellQuote()).append(" || exit 1; ")
-        append(command)
-    }
+    private fun buildWrappedCommand(command: String, workingDir: File): String =
+        environmentExports() +
+            "cd ${workingDir.absolutePath.shellQuote()} || exit 1;\n$command"
 
-    internal fun environmentExports(): String = buildString {
-        append("export HOME=").append(defaultCwd.absolutePath.shellQuote())
-        append(" TMPDIR=").append(tempDir.absolutePath.shellQuote())
-        append(" PATH=").append(DEFAULT_PATH.shellQuote())
-        append(" SHELL=").append(SYSTEM_SHELL)
-        append(" TERM=dumb NO_COLOR=1 PAGER=cat CI=true; ")
-    }
-
-    private fun baseEnvironment(): Map<String, String> = mapOf(
+    private fun baseEnvironment() = mapOf(
         "HOME" to defaultCwd.absolutePath,
         "TMPDIR" to tempDir.absolutePath,
-        "PATH" to DEFAULT_PATH,
-        "SHELL" to SYSTEM_SHELL,
+        "PATH" to searchPath,
+        "SHELL" to shell,
         "TERM" to "dumb",
         "NO_COLOR" to "1",
         "PAGER" to "cat",
         "CI" to "true",
     )
 
-    private fun startSessionProcess(root: Boolean): Process {
-        val setsidAvailable = File(SETSID).let { it.isFile && it.canExecute() }
-        val builder = when {
-            // su -c <shell> 让 shell 直接接管 stdin/stdout, 比依赖 su 默认 shell 的行为更确定
-            root -> ProcessBuilder(
-                LocalShellRuntime.suPath() ?: error("su is not available"),
-                "-c",
-                SYSTEM_SHELL,
-            )
-
-            setsidAvailable -> ProcessBuilder(SETSID, SYSTEM_SHELL)
-            else -> ProcessBuilder(SYSTEM_SHELL)
-        }
-        // 不能把 cwd 交给 ProcessBuilder: root 目录在提权前不可进入, 由 setup 脚本 cd
-        return builder
-            .redirectErrorStream(true)
-            .apply { environment().putAll(baseEnvironment()) }
-            .start()
+    private fun environmentExports() = baseEnvironment().entries.joinToString(" ", "export ", "; ") {
+        "${it.key}=${it.value.shellQuote()}"
     }
 
     private fun resolveWorkingDir(cwd: String?, requireExists: Boolean): File {
@@ -285,307 +222,101 @@ class LocalShellRunner(context: Context) {
             File(raw).isAbsolute -> File(raw)
             else -> File(defaultCwd, raw)
         }
-        if (requireExists) {
-            require(dir.exists()) { "Working directory does not exist: ${dir.absolutePath}" }
-            require(dir.isDirectory) { "Working path is not a directory: ${dir.absolutePath}" }
-            return dir.canonicalFile
-        }
-        // root 能进入 App 身份看不到的目录, 是否存在交给 shell 里的 cd 判断
-        return dir
+        if (!requireExists) return dir
+        require(dir.isDirectory) { "Working directory does not exist or is not a directory: ${dir.absolutePath}" }
+        return dir.canonicalFile
     }
 
-    private fun killProcessGroup(pidFile: File, root: Boolean) {
-        val pid = runCatching { pidFile.readText().trim().toLong() }.getOrNull() ?: return
-        if (pid > 1) runQuietly("kill -9 -$pid 2>/dev/null", root)
-    }
-
-    /** 结束进程并尽可能回收它派生的进程; 会话、一次性命令与后台任务共用 */
     internal fun terminateProcess(process: Process, pidFile: File, root: Boolean) {
-        val pid = runCatching { pidFile.readText().trim().toLong() }.getOrNull()
-        // 先记录子孙进程: 根进程一死, 它们会被 reparent 到 init, 再也找不到
-        val descendants = if (pid != null && pid > 1) collectProcessTree(pid) else emptyList()
-        runCatching { process.destroy() }
-        val exited = runCatching { process.waitFor(500, TimeUnit.MILLISECONDS) }.getOrDefault(false)
-        if (!exited) {
-            runCatching { process.destroyForcibly() }
-            runCatching { process.waitFor(1, TimeUnit.SECONDS) }
-        }
-        if (pid != null && pid > 1) {
-            runQuietly("kill -9 -$pid 2>/dev/null", root)
-            runQuietly("kill -9 $pid 2>/dev/null", root)
-        }
-        if (descendants.isNotEmpty()) {
-            runQuietly("kill -9 ${descendants.joinToString(" ")} 2>/dev/null", root)
-        }
-        pidFile.delete()
-    }
-
-    private fun collectProcessTree(rootPid: Long): List<Long> {
-        val childrenByParent = HashMap<Long, MutableList<Long>>()
-        File("/proc").listFiles()?.forEach { dir ->
-            val pid = dir.name.toLongOrNull() ?: return@forEach
-            val stat = runCatching { File(dir, "stat").readText() }.getOrNull() ?: return@forEach
-            val close = stat.lastIndexOf(')')
-            if (close < 0) return@forEach
-            // "pid (comm) state ppid ..."
-            val ppid = stat.substring(close + 2).split(' ').getOrNull(1)?.toLongOrNull() ?: return@forEach
-            childrenByParent.getOrPut(ppid) { mutableListOf() }.add(pid)
-        }
-        val result = mutableListOf<Long>()
-        val queue = ArrayDeque<Long>().apply { add(rootPid) }
-        while (queue.isNotEmpty()) {
-            childrenByParent[queue.removeFirst()]?.forEach { child ->
-                if (child != rootPid && child !in result) {
-                    result.add(child)
-                    queue.add(child)
+        // Cleanup must still run if interruption arrived while writing or starting the shell.
+        val interrupted = Thread.interrupted()
+        try {
+            val recorded = runCatching { pidFile.readText().trim() }.getOrDefault("")
+            val pid = recorded.removePrefix("user:").toLongOrNull()?.takeIf { it > 1 }
+            if (pid != null) {
+                // Before su is ready only its app-owned proxy exists; do not request root again to cancel it.
+                runQuietly(buildProcessCleanup(pid), root && !recorded.startsWith("user:"))
+            }
+            if (process.isAlive) {
+                runCatching { process.destroy() }
+                if (!runCatching { process.waitFor(500, TimeUnit.MILLISECONDS) }.getOrDefault(false)) {
+                    runCatching { process.destroyForcibly() }
+                    runCatching { process.waitFor(1, TimeUnit.SECONDS) }
                 }
             }
+        } finally {
+            pidFile.delete()
+            if (interrupted) Thread.currentThread().interrupt()
         }
-        return result
     }
 
-    internal fun runQuietly(command: String, root: Boolean) {
+    private fun runQuietly(command: String, root: Boolean) {
         runCatching {
-            val builder = if (root) {
-                ProcessBuilder(LocalShellRuntime.suPath() ?: return, "-c", command)
-            } else {
-                ProcessBuilder(SYSTEM_SHELL, "-c", command)
+            val args = if (root) listOf(suPath() ?: return, "-c", command) else listOf(shell, "-c", command)
+            val cleanup = ProcessBuilder(args).redirectOutput(File("/dev/null")).redirectError(File("/dev/null"))
+                .apply { environment()["PATH"] = searchPath }.start()
+            try {
+                if (!cleanup.waitFor(2, TimeUnit.SECONDS)) cleanup.destroyForcibly()
+            } finally {
+                if (cleanup.isAlive) cleanup.destroyForcibly()
+                cleanup.outputStream.close()
             }
-            builder
-                .redirectOutput(File("/dev/null"))
-                .redirectError(File("/dev/null"))
-                .start()
-                .waitFor(500, TimeUnit.MILLISECONDS)
         }
     }
 
-    private fun pruneClosedSessionsLocked() {
-        val closed = sessions.values.filterNot { it.isAlive }
-        closed.forEach { session ->
-            sessions.remove(session.id)
-            runCatching { session.close() }
-        }
-    }
-
-    /** 后台命令; 终止时会一并结束命令派生的子进程 */
     private inner class LocalBackgroundCommand(
         private val process: Process,
         private val logFile: File,
-        override val logPath: String,
         private val pidFile: File,
         private val root: Boolean,
     ) : WorkspaceBackgroundCommand {
-        override fun waitFor(): Int = process.waitFor()
+        private val log = BackgroundCommandLog(logFile)
+        private val cleanupLock = Any()
+        private var cleaned = false
+        override val logPath: String get() = logFile.absolutePath
 
-        override fun outputSize(): Long = logFile.length()
-
-        override fun readOutput(offset: Long, maxBytes: Int): ByteArray {
-            if (!logFile.isFile) return ByteArray(0)
-            return RandomAccessFile(logFile, "r").use { file ->
-                val available = (file.length() - offset).coerceAtLeast(0)
-                val buffer = ByteArray(minOf(available, maxBytes.toLong()).toInt())
-                file.seek(offset)
-                file.readFully(buffer)
-                buffer
-            }
-        }
-
-        override fun kill() {
-            Log.i(TAG, "kill background command, root=$root")
-            terminateProcess(process, pidFile, root)
-        }
-    }
-}
-
-data class LocalShellSessionInfo(
-    val id: String,
-    val identity: String,
-    val cwd: String,
-    val alive: Boolean,
-)
-
-/**
- * 一个常驻 shell 进程。命令按顺序写入 stdin, 输出经同一管道回流;
- * 每段命令后打印带随机标记的一行, 用来确定边界、退出码与新的工作目录。
- */
-class LocalShellSession internal constructor(
-    val id: String,
-    val identity: String,
-    private val process: Process,
-    private val pidFile: File,
-    private val runner: LocalShellRunner,
-    initialCwd: String,
-) : AutoCloseable {
-    private val commandLock = Any()
-    private val writeLock = Any()
-    private val writer = BufferedWriter(OutputStreamWriter(process.outputStream, StandardCharsets.UTF_8))
-    private val lines = LineQueue(MAX_BUFFERED_LINES)
-    private val reader = thread(name = "local-shell-session-$id", isDaemon = true) {
-        try {
-            process.inputStream.bufferedReader().use { input ->
-                while (true) {
-                    val line = input.readLine() ?: break
-                    lines.offer(line)
-                }
-            }
-        } catch (_: IOException) {
+        override fun waitFor(): Int = try {
+            process.waitFor()
         } finally {
-            lines.close()
-        }
-    }
-
-    @Volatile
-    var cwd: String = initialCwd
-        private set
-
-    @Volatile
-    var closed: Boolean = false
-        private set
-
-    val isAlive: Boolean
-        get() = !closed && process.isAlive
-
-    internal fun writeRaw(script: String) = synchronized(writeLock) {
-        writer.write(script)
-        writer.flush()
-    }
-
-    /** stderr 合并进 stdout; 会话超时后无法可靠地中断管道里的子进程, 因此关闭整个 shell */
-    fun exec(command: String, workingDir: String? = null, timeoutMillis: Long = 30_000L): LocalShellResult =
-        synchronized(commandLock) {
-            if (!isAlive) return LocalShellResult(-1, "", "Shell session is closed", false, false, sessionClosed = true)
-
-            val marker = "__RIKKA_SHELL_${UUID.randomUUID().toString().replace("-", "")}__"
-            val script = buildString {
-                // stdin 是命令通道, 命令必须从 /dev/null 读; 需要输入时用管道或 heredoc
-                if (!workingDir.isNullOrBlank()) {
-                    append("if cd ").append(workingDir.shellQuote()).append(" 2>/dev/null; then\n")
-                    append("{\n").append(command).append("\n} < /dev/null\n")
-                    append("else\nfalse\nfi\n")
-                } else {
-                    append("{\n").append(command).append("\n} < /dev/null\n")
-                }
-                append("printf '\\n%s %s %s\\n' '").append(marker).append("' \"\$?\" \"\$PWD\"\n")
-            }
-            try {
-                writeRaw(script)
-            } catch (e: IOException) {
-                closeInternal()
-                return LocalShellResult(-1, "", "Failed to write to shell: ${e.message}", false, false, true)
-            }
-
-            val output = StringBuilder()
-            var truncated = false
-            val deadline = System.nanoTime() + timeoutMillis * 1_000_000L
-            while (true) {
-                val remainingMs = (deadline - System.nanoTime()) / 1_000_000L
-                if (remainingMs <= 0) {
-                    closeInternal()
-                    return LocalShellResult(
-                        exitCode = -1,
-                        stdout = output.toString(),
-                        stderr = "Command timed out after ${timeoutMillis / 1_000}s; the shell session was closed",
-                        timedOut = true,
-                        truncated = truncated,
-                        sessionClosed = true,
-                    )
-                }
-                val line = lines.poll(remainingMs)
-                if (line == null) {
-                    if (System.nanoTime() >= deadline) {
-                        closeInternal()
-                        return LocalShellResult(
-                            exitCode = -1,
-                            stdout = output.toString(),
-                            stderr = "Command timed out after ${timeoutMillis / 1_000}s; the shell session was closed",
-                            timedOut = true,
-                            truncated = truncated,
-                            sessionClosed = true,
-                        )
-                    }
-                    closeInternal()
-                    return LocalShellResult(
-                        exitCode = -1,
-                        stdout = output.toString(),
-                        stderr = "Shell session exited while running the command",
-                        timedOut = false,
-                        truncated = truncated,
-                        sessionClosed = true,
-                    )
-                }
-                if (line.startsWith("$marker ")) {
-                    val rest = line.removePrefix("$marker ").trim()
-                    val exitCode = rest.substringBefore(' ').toIntOrNull() ?: -1
-                    val newCwd = rest.substringAfter(' ', "").trim()
-                    if (newCwd.isNotEmpty()) cwd = newCwd
-                    return LocalShellResult(
-                        exitCode = exitCode,
-                        stdout = output.toString(),
-                        stderr = "",
-                        timedOut = false,
-                        truncated = truncated,
-                    )
-                }
-                val remaining = MAX_OUTPUT_CHARS - output.length
-                if (remaining > line.length + 1) {
-                    output.append(line).append('\n')
-                } else {
-                    if (remaining > 0) output.append(line, 0, remaining)
-                    truncated = true
-                }
-            }
-            error("unreachable")
+            cleanup()
         }
 
-    override fun close() = synchronized(commandLock) { closeInternal() }
+        override fun outputSize() = log.size()
+        override fun readOutput(offset: Long, maxBytes: Int) = log.read(offset, maxBytes)
+        override fun kill() = cleanup()
 
-    private fun closeInternal() {
-        if (closed) return
-        closed = true
-        runCatching { writer.close() }
-        runner.terminateProcess(process, pidFile, identity == "root")
-        lines.close()
-        runCatching { reader.join(500) }
-    }
-}
-
-/** 有界行队列: 队列满时让读取线程等待, 由管道反压输出方, 不丢行 */
-private class LineQueue(private val maxLines: Int) {
-    private val queue = ArrayDeque<String>()
-    private val lock = ReentrantLock()
-    private val notEmpty = lock.newCondition()
-    private val notFull = lock.newCondition()
-
-    @Volatile
-    private var closed = false
-
-    fun offer(line: String) = lock.withLock {
-        while (!closed && queue.size >= maxLines) notFull.await()
-        if (closed) return@withLock
-        queue.addLast(line)
-        notEmpty.signal()
-    }
-
-    fun close() = lock.withLock {
-        closed = true
-        notEmpty.signalAll()
-        notFull.signalAll()
-    }
-
-    /** 超时或队列关闭且已排空时返回 null */
-    fun poll(timeoutMillis: Long): String? {
-        val deadline = System.nanoTime() + timeoutMillis.coerceAtLeast(0) * 1_000_000L
-        lock.withLock {
-            while (true) {
-                queue.removeFirstOrNull()?.let {
-                    notFull.signal()
-                    return it
-                }
-                if (closed) return null
-                val remaining = (deadline - System.nanoTime()) / 1_000_000L
-                if (remaining <= 0) return null
-                notEmpty.await(remaining, TimeUnit.MILLISECONDS)
+        private fun cleanup() = synchronized(cleanupLock) {
+            if (!cleaned) {
+                terminateProcess(process, pidFile, root)
+                cleaned = true
             }
         }
     }
 }
+
+// Record descendants before killing the parent, then kill both the process group and escaped descendants.
+internal fun buildProcessCleanup(pid: Long): String {
+    require(pid > 1)
+    return """
+        parents=$pid
+        targets=$pid
+        while [ -n "${'$'}parents" ]; do
+          next=
+          for stat in /proc/[0-9]*/stat; do
+            [ -r "${'$'}stat" ] || continue
+            IFS= read -r record < "${'$'}stat" || continue
+            child=${'$'}{record%% *}
+            fields=${'$'}{record##*) }
+            parent=${'$'}{fields#* }
+            parent=${'$'}{parent%% *}
+            case " ${'$'}parents " in *" ${'$'}parent "*) next="${'$'}next ${'$'}child" ;; esac
+          done
+          targets="${'$'}targets ${'$'}next"
+          parents=${'$'}next
+        done
+        kill -9 -$pid 2>/dev/null
+        kill -9 ${'$'}targets 2>/dev/null
+    """.trimIndent()
+}
+
+data class LocalShellSessionInfo(val id: String, val identity: String, val cwd: String, val alive: Boolean)

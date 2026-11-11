@@ -1,6 +1,9 @@
 package me.rerere.rikkahub.data.ai.tools.local
 
 import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import me.rerere.ai.core.Tool
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.event.AppEventBus
@@ -52,7 +55,16 @@ class LocalTools(
         )
     }
 
-    private val localShellRunner by lazy { LocalShellRunner(context) }
+    private val localShellRunnerDelegate = lazy { LocalShellRunner(context) }
+    private val localShellRunner by localShellRunnerDelegate
+
+    suspend fun closeShellSessions(conversationId: Uuid) {
+        if (localShellRunnerDelegate.isInitialized()) {
+            withContext(NonCancellable + Dispatchers.IO) {
+                localShellRunner.closeConversation(conversationId)
+            }
+        }
+    }
 
     fun getTools(
         options: List<LocalToolOption>,
@@ -91,6 +103,7 @@ class LocalTools(
             tools.add(
                 buildLocalShellTool(
                     runner = localShellRunner,
+                    conversationId = conversationId,
                     defaultRoot = localShellUseRoot,
                     needsApproval = localShellNeedsApproval,
                 )

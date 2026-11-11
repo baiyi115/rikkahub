@@ -388,10 +388,7 @@ private fun createShellKillTool(background: BackgroundShell) = Tool(
 )
 
 private fun BackgroundShellTask.toJson(extra: JsonObjectBuilder.() -> Unit = {}) = buildJsonObject {
-    put("taskId", id)
-    put("status", status.name.lowercase())
-    exitCode?.let { put("exitCode", it) }
-    put("logPath", logPath)
+    putBackgroundShellTask(this@toJson)
     extra()
 }
 

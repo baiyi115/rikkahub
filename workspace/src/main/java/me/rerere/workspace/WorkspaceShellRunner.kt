@@ -67,6 +67,7 @@ fun Process.readResult(
     timeoutMillis: Long,
     stdin: ByteArray? = null,
     maxChars: Int = MAX_OUTPUT_CHARS,
+    onFinished: () -> Unit = {},
     terminate: Process.() -> Unit = { destroyForcibly() },
 ): WorkspaceCommandResult {
     val stdout = StreamCollector(inputStream, maxChars)
@@ -83,7 +84,9 @@ fun Process.readResult(
     }
     try {
         val finished = waitFor(timeoutMillis, TimeUnit.MILLISECONDS)
-        if (!finished) {
+        if (finished) {
+            onFinished()
+        } else {
             terminate()
         }
         stdinWriter?.join(1_000)

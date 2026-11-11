@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -105,7 +106,7 @@ data class BackgroundShellLogTail(
  * 命令自行结束时把结束通知发到会话收件箱 (见 [ConversationInbox]), 模型不需要轮询;
  * 模型在通知送达前已经读过结果或终止了命令时撤回。
  *
- * 任务只保存在内存里, 进程随应用进程一起结束, 应用重启后不再存在。
+ * 任务只保存在内存里，应用重启后无法恢复管理；系统强杀时不能保证 root 子进程被清理。
  * 有命令在运行时由 [BackgroundShellForegroundService] 让进程留在前台。
  */
 class BackgroundShellManager(
@@ -159,10 +160,16 @@ class BackgroundShellManager(
     ): BackgroundShellTask {
         requireCapacity(conversationId)
         val id = newId()
-        val backgroundCommand = withContext(Dispatchers.IO) {
-            runner.startBackgroundCommand(command, cwd, root, id)
+        var started: WorkspaceBackgroundCommand? = null
+        try {
+            val backgroundCommand = runInterruptible(Dispatchers.IO) {
+                runner.startBackgroundCommand(command, cwd, root, id).also { started = it }
+            }
+            return register(conversationId, LOCAL_SHELL_WORKSPACE_ID, command, id, backgroundCommand)
+        } catch (e: Throwable) {
+            withContext(NonCancellable + Dispatchers.IO) { started?.kill() }
+            throw e
         }
-        return register(conversationId, LOCAL_SHELL_WORKSPACE_ID, command, id, backgroundCommand)
     }
 
     /** 读取上次之后的新输出; [waitMillis] 大于 0 时先等待命令结束, 超时后照常返回 */
