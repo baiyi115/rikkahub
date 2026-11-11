@@ -70,6 +70,7 @@ class ChatToolFactory(
                     conversationId = conversationId,
                     backgroundShellManager = backgroundShellManager,
                     localShellUseRoot = assistant.localShellUseRoot,
+                    localShellNeedsApproval = assistant.localShellNeedsApproval,
                 )
             )
             if (assistant.enableRecentChatsReference) {

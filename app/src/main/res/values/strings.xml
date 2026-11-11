@@ -1863,4 +1863,6 @@
   <string name="assistant_page_local_tools_local_shell_root_title">Run as root</string>
   <string name="assistant_page_local_tools_local_shell_root_desc">Execute commands through su when it is granted. Only works on rooted devices.</string>
   <string name="assistant_page_local_tools_local_shell_root_unavailable">su was not found on this device</string>
+  <string name="assistant_page_local_tools_local_shell_approval_title">Ask before running</string>
+  <string name="assistant_page_local_tools_local_shell_approval_desc">When off, local shell commands run without confirmation each time</string>
 </resources>

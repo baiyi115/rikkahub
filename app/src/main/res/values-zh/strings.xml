@@ -1865,4 +1865,6 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="assistant_page_local_tools_local_shell_root_title">以 root 运行</string>
   <string name="assistant_page_local_tools_local_shell_root_desc">在已授权时通过 su 执行命令，仅适用于已 Root 的设备。</string>
   <string name="assistant_page_local_tools_local_shell_root_unavailable">未在此设备上找到 su</string>
+  <string name="assistant_page_local_tools_local_shell_approval_title">执行前询问</string>
+  <string name="assistant_page_local_tools_local_shell_approval_desc">关闭后，本机 Shell 命令将直接执行，不再逐条确认</string>
 </resources>

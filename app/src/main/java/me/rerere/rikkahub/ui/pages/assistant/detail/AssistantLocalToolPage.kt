@@ -38,6 +38,7 @@ import me.rerere.hugeicons.stroke.Clock01
 import me.rerere.hugeicons.stroke.JavaScript
 import me.rerere.hugeicons.stroke.Key01
 import me.rerere.hugeicons.stroke.MessageQuestion
+import me.rerere.hugeicons.stroke.ShieldCheck
 import me.rerere.hugeicons.stroke.SmartPhone01
 import me.rerere.hugeicons.stroke.Tap01
 import me.rerere.hugeicons.stroke.VolumeHigh
@@ -315,6 +316,32 @@ private fun AssistantLocalToolContent(
                     },
                     headlineContent = {
                         Text(stringResource(R.string.assistant_page_local_tools_local_shell_root_title))
+                    },
+                )
+                val needsApproval = assistant.localShellNeedsApproval
+                switchItem(
+                    checked = needsApproval,
+                    onCheckedChange = { onUpdate(assistant.copy(localShellNeedsApproval = it)) },
+                    leadingContent = {
+                        CardGroupIcon(
+                            icon = HugeIcons.ShieldCheck,
+                            containerColor = if (needsApproval) {
+                                MaterialTheme.colorScheme.primaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.surfaceContainerHigh
+                            },
+                            contentColor = if (needsApproval) {
+                                MaterialTheme.colorScheme.onPrimaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                    },
+                    supportingContent = {
+                        Text(stringResource(R.string.assistant_page_local_tools_local_shell_approval_desc))
+                    },
+                    headlineContent = {
+                        Text(stringResource(R.string.assistant_page_local_tools_local_shell_approval_title))
                     },
                 )
             }

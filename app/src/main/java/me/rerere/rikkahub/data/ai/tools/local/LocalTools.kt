@@ -59,6 +59,7 @@ class LocalTools(
         conversationId: Uuid,
         backgroundShellManager: BackgroundShellManager,
         localShellUseRoot: Boolean = false,
+        localShellNeedsApproval: Boolean = true,
     ): List<Tool> {
         val tools = mutableListOf<Tool>()
         if (options.contains(LocalToolOption.JavascriptEngine)) {
@@ -87,13 +88,20 @@ class LocalTools(
             tools.add(chartDisplayTool)
         }
         if (options.contains(LocalToolOption.LocalShell)) {
-            tools.add(buildLocalShellTool(localShellRunner, localShellUseRoot))
+            tools.add(
+                buildLocalShellTool(
+                    runner = localShellRunner,
+                    defaultRoot = localShellUseRoot,
+                    needsApproval = localShellNeedsApproval,
+                )
+            )
             tools.add(
                 buildLocalShellJobTool(
                     runner = localShellRunner,
                     manager = backgroundShellManager,
                     conversationId = conversationId,
                     defaultRoot = localShellUseRoot,
+                    needsApproval = localShellNeedsApproval,
                 )
             )
         }

@@ -29,7 +29,11 @@ private const val MAX_JOB_READ_BYTES = 64 * 1024
 private const val MAX_JOB_WAIT_MS = 60_000L
 
 /** [defaultRoot] 仅在设备上存在 su 时生效, 模型仍可显式传 identity 覆盖 */
-fun buildLocalShellTool(runner: LocalShellRunner, defaultRoot: Boolean): Tool {
+fun buildLocalShellTool(
+    runner: LocalShellRunner,
+    defaultRoot: Boolean,
+    needsApproval: Boolean = true,
+): Tool {
     val defaultIdentity = if (defaultRoot && LocalShellRuntime.isRootAvailable) "root" else "user"
     val defaultCwd = runner.defaultCwd.absolutePath
     return Tool(
@@ -108,7 +112,7 @@ fun buildLocalShellTool(runner: LocalShellRunner, defaultRoot: Boolean): Tool {
             )
         },
         needsApproval = { input ->
-            when (input.jsonObject.actionOrNull()) {
+            needsApproval && when (input.jsonObject.actionOrNull()) {
                 "exec", "open", "check_root" -> true
                 else -> false
             }
@@ -125,6 +129,7 @@ fun buildLocalShellJobTool(
     manager: BackgroundShellManager,
     conversationId: Uuid,
     defaultRoot: Boolean,
+    needsApproval: Boolean = true,
 ): Tool {
     val defaultIdentity = if (defaultRoot && LocalShellRuntime.isRootAvailable) "root" else "user"
     return Tool(
@@ -194,7 +199,7 @@ fun buildLocalShellJobTool(
                 required = listOf("action"),
             )
         },
-        needsApproval = { input -> input.jsonObject.actionOrNull() == "start" },
+        needsApproval = { input -> needsApproval && input.jsonObject.actionOrNull() == "start" },
         execute = { input ->
             executeLocalShellJobTool(runner, manager, conversationId, input.jsonObject, defaultIdentity)
         },
