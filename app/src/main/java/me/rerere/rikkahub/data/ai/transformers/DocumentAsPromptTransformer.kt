@@ -10,6 +10,7 @@ import me.rerere.document.DocxParser
 import me.rerere.document.EpubParser
 import me.rerere.document.PdfParser
 import me.rerere.document.PptxParser
+import me.rerere.document.XlsxParser
 import java.io.File
 
 object DocumentAsPromptTransformer : InputMessageTransformer {
@@ -33,7 +34,7 @@ object DocumentAsPromptTransformer : InputMessageTransformer {
                                   $content
                                   ```
                                   </UploadFile>
-                                  """.trimMargin()
+                                """.trimMargin()
                                 add(0, UIMessagePart.Text(prompt))
                             }
                         }
@@ -59,6 +60,10 @@ object DocumentAsPromptTransformer : InputMessageTransformer {
         return EpubParser.parse(file)
     }
 
+    private fun parseXlsxAsText(file: File): String {
+        return XlsxParser.parse(file)
+    }
+
     // 上传文件保存在 filesDir/upload 下, 该目录通过 proot 挂载到 workspace 的 /upload
     // 返回文件在 workspace 内的绝对路径, 便于 AI 用 workspace 工具直接读取原始文件
     private fun resolveWorkspacePath(document: UIMessagePart.Document): String? {
@@ -79,6 +84,9 @@ object DocumentAsPromptTransformer : InputMessageTransformer {
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document" -> parseDocxAsText(file)
                 "application/vnd.openxmlformats-officedocument.presentationml.presentation" -> parsePptxAsText(file)
                 "application/epub+zip" -> parseEpubAsText(file)
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "application/vnd.ms-excel.sheet.macroEnabled.12" -> parseXlsxAsText(file)
+
                 else -> file.readText()
             }
         }.getOrElse {

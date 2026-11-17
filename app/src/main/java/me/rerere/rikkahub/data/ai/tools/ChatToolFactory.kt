@@ -189,6 +189,13 @@ class ChatToolFactory(
             )
             return emptyList()
         }
-        return createWorkspaceTools(workspaceId, workspaceRepository, cwd, conversationId, backgroundShellManager)
+        return createWorkspaceTools(
+            workspaceId,
+            workspaceRepository,
+            context.cacheDir,
+            cwd,
+            conversationId,
+            backgroundShellManager,
+        )
     }
 }

@@ -22,6 +22,7 @@ import me.rerere.workspace.WorkspaceLayout
 import me.rerere.workspace.WorkspaceManager
 import org.koin.java.KoinJavaComponent.getKoin
 import java.io.ByteArrayOutputStream
+import java.io.File
 import kotlin.uuid.Uuid
 
 private const val SHELL_TIMEOUT_MAX_SECONDS = 600L
@@ -43,6 +44,7 @@ fun resolveWorkspaceToolApproval(name: String, overrides: Map<String, Boolean>):
 suspend fun createWorkspaceTools(
     workspaceId: String?,
     workspaceRepository: WorkspaceRepository,
+    tempDir: File,
     cwd: String? = null,
     conversationId: Uuid? = null,
     backgroundShellManager: BackgroundShellManager? = null,
@@ -61,6 +63,7 @@ suspend fun createWorkspaceTools(
 
     return buildList {
         add(createReadFileTool(workspaceId, layout, ::needsApproval, workspaceRepository))
+        add(createReadDocumentTool(workspaceId, layout, workspaceRepository, tempDir))
         addAll(createWorkspaceSearchTools(workspaceId, layout, workspaceRepository))
         if (workspace.capabilities().fileWriteTools) {
             add(createWriteFileTool(workspaceId, layout, ::needsApproval, workspaceRepository))
@@ -92,6 +95,7 @@ private fun createReadFileTool(
         Read a file using the assistant's bound workspace Rootfs. Paths must be absolute inside Rootfs.
         Use ${layout.workspaceDir} for the workspace files area.
         Supports UTF-8 text files and image files (png, jpg, jpeg, gif, webp, bmp, svg, heic, heif, avif, ico).
+        For PDF, DOCX, PPTX, XLSX and EPUB documents use workspace_read_document instead.
     """.trimIndent().replace("\n", " "),
     parameters = {
         InputSchema.Obj(
