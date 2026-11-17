@@ -86,6 +86,33 @@ class WorkspaceManager(
     ): List<WorkspaceFileEntry> =
         fileSystem.list(areaDir(root, area), path)
 
+    /** 按环境内绝对路径列出目录内容, 条目 path 为归一化后的绝对路径; 支持 /workspace、挂载目录与 Rootfs 内部路径 */
+    fun listRootfs(
+        root: String,
+        path: String,
+        extraMounts: List<WorkspaceBindMount> = emptyList(),
+    ): List<WorkspaceFileEntry> {
+        requireMountsAvailable(extraMounts)
+        val base = normalizeAbsolutePath(path)
+        val location = resolveRootfsPath(root, path, extraMounts)
+        return fileSystem.list(location.rootDir, location.relativePath).map { entry ->
+            entry.copy(path = if (base == "/") "/${entry.name}" else "$base/${entry.name}")
+        }
+    }
+
+    /** 只做字面归一化, 不解析软链, 与 Rootfs 内的路径语义一致 */
+    private fun normalizeAbsolutePath(path: String): String {
+        val segments = ArrayDeque<String>()
+        path.replace('\\', '/').trim().split('/').forEach { segment ->
+            when (segment) {
+                "", "." -> Unit
+                ".." -> segments.removeLastOrNull()
+                else -> segments.addLast(segment)
+            }
+        }
+        return segments.joinToString("/", prefix = "/")
+    }
+
     fun readText(
         root: String,
         path: String,

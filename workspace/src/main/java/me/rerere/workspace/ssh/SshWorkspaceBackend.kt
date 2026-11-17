@@ -53,6 +53,25 @@ class SshWorkspaceBackend(
         }
     }
 
+    override fun listAbsolute(path: String): List<WorkspaceFileEntry> {
+        val dir = normalizeAbsolute(path)
+        return withSftp(WorkspaceStorageArea.LINUX, retry = true) { sftp ->
+            val attrs = sftp.requireStat(dir, path)
+            require(attrs.isDir) { "Path is not a directory: $path" }
+            sftp.ls(dir.sftpQuote())
+                .filter { it.filename != "." && it.filename != ".." }
+                .map { entry ->
+                    val child = dir.child(entry.filename)
+                    // 指向目录的软链按目录展示, 和 listFiles 一致
+                    val isDirectory = entry.attrs.isDir ||
+                        entry.attrs.isLink && sftp.statOrNull(child)?.isDir == true
+                    entry.attrs.toEntry(child, entry.filename, isDirectory)
+                }
+                .sortedWith(compareBy<WorkspaceFileEntry> { !it.isDirectory }.thenBy { it.name.lowercase() })
+                .take(workspaceConfig.maxListEntries)
+        }
+    }
+
     override fun readText(path: String): String {
         val file = resolve(WorkspaceStorageArea.FILES, path)
         return withSftp(WorkspaceStorageArea.FILES, retry = true) { sftp ->

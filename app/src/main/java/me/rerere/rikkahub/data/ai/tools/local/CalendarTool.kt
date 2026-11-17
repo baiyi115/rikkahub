@@ -109,17 +109,21 @@ internal fun buildCalendarQueryTool(context: Context): Tool = Tool(
         try {
             startTime = if (beginRaw != null) {
                 parseCalendarTime(beginRaw, zone)
-            } else when (rangePreset) {
-                "week" -> now.toLocalDate().atStartOfDay(zone).minusDays(now.dayOfWeek.value.toLong() - 1)
-                "month" -> now.toLocalDate().withDayOfMonth(1).atStartOfDay(zone)
-                else -> now.toLocalDate().atStartOfDay(zone)
+            } else {
+                when (rangePreset) {
+                    "week" -> now.toLocalDate().atStartOfDay(zone).minusDays(now.dayOfWeek.value.toLong() - 1)
+                    "month" -> now.toLocalDate().withDayOfMonth(1).atStartOfDay(zone)
+                    else -> now.toLocalDate().atStartOfDay(zone)
+                }
             }
             endTime = if (endRaw != null) {
                 parseCalendarTime(endRaw, zone)
-            } else when (rangePreset) {
-                "week" -> startTime.plusDays(7)
-                "month" -> startTime.plusMonths(1)
-                else -> now.toLocalDate().plusDays(1).atStartOfDay(zone)
+            } else {
+                when (rangePreset) {
+                    "week" -> startTime.plusDays(7)
+                    "month" -> startTime.plusMonths(1)
+                    else -> now.toLocalDate().plusDays(1).atStartOfDay(zone)
+                }
             }
         } catch (e: Exception) {
             val payload = buildJsonObject {
@@ -153,10 +157,14 @@ internal fun buildCalendarQueryTool(context: Context): Tool = Tool(
 
         val selection = if (query != null) {
             "${CalendarContract.Instances.TITLE} LIKE ?"
-        } else null
+        } else {
+            null
+        }
         val selectionArgs = if (query != null) {
             arrayOf("%$query%")
-        } else null
+        } else {
+            null
+        }
 
         val uri = CalendarContract.Instances.CONTENT_URI.buildUpon()
             .appendPath(startMs.toString())
@@ -381,8 +389,21 @@ internal fun buildCalendarCreateTool(context: Context): Tool = Tool(
         }
 
         val eventId = ContentUris.parseId(uri)
+        // 写操作回读校验: 插入成功后按 ID 读回, 确认标题与时间确实落库
+        val verificationError = runCatching {
+            verifyCalendarEvent(context, eventId, title, eventStartMillis, eventEndMillis)
+        }.getOrElse { "verification query failed: ${it.message}" }
+        if (verificationError != null) {
+            val payload = buildJsonObject {
+                put("error", "VERIFY_FAILED")
+                put("event_id", eventId)
+                put("message", verificationError)
+            }
+            return@Tool listOf(UIMessagePart.Text(payload.toString()))
+        }
         val payload = buildJsonObject {
             put("success", true)
+            put("verified", true)
             put("event_id", eventId)
             put("title", title)
             put("start", startTime.withNano(0).toString())
@@ -394,12 +415,46 @@ internal fun buildCalendarCreateTool(context: Context): Tool = Tool(
     }
 )
 
+/** 按 ID 读回刚插入的事件; 返回 null 表示与写入一致, 否则返回差异说明 */
+private fun verifyCalendarEvent(
+    context: Context,
+    eventId: Long,
+    title: String,
+    startMillis: Long,
+    endMillis: Long,
+): String? {
+    val uri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, eventId)
+    val projection = arrayOf(
+        CalendarContract.Events.TITLE,
+        CalendarContract.Events.DTSTART,
+        CalendarContract.Events.DTEND,
+        CalendarContract.Events.DELETED,
+    )
+    return context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+        if (!cursor.moveToFirst()) return@use "the event was not found after insert"
+        if (cursor.getInt(3) == 1) return@use "the event was deleted right after insert"
+        val actualTitle = cursor.getString(0).orEmpty()
+        val actualStart = cursor.getLong(1)
+        val actualEnd = cursor.getLong(2)
+        when {
+            actualTitle != title -> "title read back as '$actualTitle'"
+            actualStart != startMillis -> "start read back as $actualStart instead of $startMillis"
+            actualEnd != endMillis -> "end read back as $actualEnd instead of $endMillis"
+            else -> null
+        }
+    } ?: "the event was not found after insert"
+}
+
 private fun hasCalendarReadPermission(context: Context): Boolean =
     ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALENDAR) == PackageManager.PERMISSION_GRANTED
 
 private fun hasCalendarWritePermission(context: Context): Boolean =
-    ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALENDAR) == PackageManager.PERMISSION_GRANTED &&
-        ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_CALENDAR) == PackageManager.PERMISSION_GRANTED
+    ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.READ_CALENDAR
+    ) == PackageManager.PERMISSION_GRANTED &&
+        ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_CALENDAR) ==
+        PackageManager.PERMISSION_GRANTED
 
 private fun getDefaultCalendarId(context: Context): Long? {
     val projection = arrayOf(CalendarContract.Calendars._ID)

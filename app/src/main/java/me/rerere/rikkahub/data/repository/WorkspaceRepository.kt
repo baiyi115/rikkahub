@@ -255,6 +255,12 @@ class WorkspaceRepository(
         return runInterruptible(Dispatchers.IO) { backendOf(workspace).listFiles(area, path) }
     }
 
+    /** 按环境内绝对路径列出目录内容, 条目 path 为绝对路径 */
+    suspend fun listAbsolute(
+        id: String,
+        path: String,
+    ): List<WorkspaceFileEntry> = readFromBackend(id) { it.listAbsolute(path) }
+
     suspend fun readText(
         id: String,
         path: String,

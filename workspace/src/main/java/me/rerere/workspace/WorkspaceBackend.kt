@@ -21,6 +21,10 @@ interface WorkspaceBackend {
 
     fun listFiles(area: WorkspaceStorageArea, path: String): List<WorkspaceFileEntry>
 
+    /** 按环境内绝对路径列出目录内容; 条目 path 为绝对路径 */
+    fun listAbsolute(path: String): List<WorkspaceFileEntry> =
+        throw UnsupportedOperationException("Listing absolute paths is not supported in this workspace")
+
     /** 读取文件区内的文本, 自带大小保护 */
     fun readText(path: String): String
 

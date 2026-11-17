@@ -61,6 +61,7 @@ suspend fun createWorkspaceTools(
 
     return buildList {
         add(createReadFileTool(workspaceId, layout, ::needsApproval, workspaceRepository))
+        addAll(createWorkspaceSearchTools(workspaceId, layout, workspaceRepository))
         if (workspace.capabilities().fileWriteTools) {
             add(createWriteFileTool(workspaceId, layout, ::needsApproval, workspaceRepository))
             add(createEditFileTool(workspaceId, layout, ::needsApproval, workspaceRepository))
@@ -153,7 +154,9 @@ private fun createWriteFileTool(
         val text = params.string("text") ?: error("text is required")
         val overwrite = params["overwrite"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: true
         val entry = workspaceRepository.writeAbsoluteText(workspaceId, path, text, overwrite)
-        listOf(UIMessagePart.Text(entry.toJson().toString()))
+        // 写操作回读校验: 确认落盘内容与请求内容一致, 避免静默截断或写到别的位置
+        requireWriteVerified(path, text, workspaceRepository.readTextInRootfs(workspaceId, path))
+        listOf(UIMessagePart.Text(entry.toJson { put("verified", true) }.toString()))
     },
 )
 
@@ -207,6 +210,7 @@ private fun createEditFileTool(
             error("${e.message} (path: $path)")
         }
         val entry = workspaceRepository.writeAbsoluteText(workspaceId, path, result.updated, overwrite = true)
+        requireWriteVerified(path, result.updated, workspaceRepository.readTextInRootfs(workspaceId, path))
         val diff = generateUnifiedDiff(original, result.updated, entry.path)
         listOf(
             UIMessagePart.Text(
@@ -216,6 +220,7 @@ private fun createEditFileTool(
                     if (result.strategy != ExactReplacer.name) put("matchStrategy", result.strategy)
                     put("sizeBytes", entry.sizeBytes)
                     put("updatedAt", entry.updatedAt)
+                    put("verified", true)
                 }.toString(),
                 // diff 存入 metadata 供 UI 渲染 diff view, 不会随工具结果发送给 API
                 metadata = diff?.let { d -> DiffMetadata(diff = d).toMetadata() },
@@ -392,10 +397,10 @@ private fun BackgroundShellTask.toJson(extra: JsonObjectBuilder.() -> Unit = {})
     extra()
 }
 
-private fun kotlinx.serialization.json.JsonObject.string(name: String): String? =
+internal fun kotlinx.serialization.json.JsonObject.string(name: String): String? =
     this[name]?.jsonPrimitive?.contentOrNull
 
-private suspend fun WorkspaceRepository.readTextInRootfs(
+internal suspend fun WorkspaceRepository.readTextInRootfs(
     workspaceId: String,
     path: String,
 ): String = readRootfsBuffer(workspaceId, path).toString(Charsets.UTF_8.name())
@@ -434,7 +439,7 @@ private suspend fun WorkspaceRepository.readImageInRootfs(
     )
 }
 
-private fun kotlinx.serialization.json.JsonObject.absolutePath(name: String): String {
+internal fun kotlinx.serialization.json.JsonObject.absolutePath(name: String): String {
     val path = string(name)?.replace('\\', '/')?.trim() ?: error("$name is required")
     require(path.isNotBlank()) { "$name is required" }
     require(path.startsWith("/")) { "$name must be an absolute path inside Rootfs" }
@@ -451,7 +456,7 @@ private fun kotlinx.serialization.json.JsonElement.pathOutsideWritableRoots(
         !layout.isWritable(jsonObject.absolutePath(name))
     }.getOrDefault(true)
 
-private fun JsonObjectBuilder.putPathProperty(layout: WorkspaceLayout, required: Boolean) {
+internal fun JsonObjectBuilder.putPathProperty(layout: WorkspaceLayout, required: Boolean) {
     put("path", buildJsonObject {
         put("type", "string")
         put(
@@ -465,10 +470,19 @@ private fun JsonObjectBuilder.putPathProperty(layout: WorkspaceLayout, required:
     })
 }
 
-private fun WorkspaceFileEntry.toJson() = buildJsonObject {
+internal fun WorkspaceFileEntry.toJson(extra: JsonObjectBuilder.() -> Unit = {}) = buildJsonObject {
     put("path", path)
     put("name", name)
     put("isDirectory", isDirectory)
     put("sizeBytes", sizeBytes)
     put("updatedAt", updatedAt)
+    extra()
+}
+
+/** 写入后回读, 内容不一致时报错, 让模型知道这次写入没有生效 */
+internal fun requireWriteVerified(path: String, expected: String, actual: String) {
+    require(expected == actual) {
+        "Write verification failed for $path: wrote ${expected.toByteArray(Charsets.UTF_8).size} bytes " +
+            "but read back ${actual.toByteArray(Charsets.UTF_8).size} bytes"
+    }
 }

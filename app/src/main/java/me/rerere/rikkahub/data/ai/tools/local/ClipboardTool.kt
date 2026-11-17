@@ -57,9 +57,23 @@ internal fun buildClipboardTool(context: Context): Tool = Tool(
             "write" -> {
                 val text = params["text"]?.jsonPrimitive?.contentOrNull ?: error("text is required")
                 context.writeClipboardText(text)
+                // 写操作回读校验: 系统可能限制后台读取剪贴板, 读不到时只报告未验证
+                val readBack = runCatching { context.readClipboardText() }.getOrNull()
+                val verified = readBack == text
                 val payload = buildJsonObject {
                     put("success", true)
+                    put("verified", verified)
                     put("text", text)
+                    if (!verified) {
+                        put(
+                            "warning",
+                            if (readBack == null) {
+                                "The clipboard could not be read back to verify the write."
+                            } else {
+                                "The clipboard content read back does not match the text that was written."
+                            }
+                        )
+                    }
                 }
                 listOf(UIMessagePart.Text(payload.toString()))
             }
