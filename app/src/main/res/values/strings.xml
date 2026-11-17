@@ -74,6 +74,10 @@
   <string name="assistant_page_invalid_json">Invalid JSON: %s</string>
   <string name="assistant_page_local_tools_ask_user_desc">Allow the AI to ask you questions for clarification</string>
   <string name="assistant_page_local_tools_ask_user_title">Ask User</string>
+  <string name="assistant_page_local_tools_subagent_title">Subagent</string>
+  <string name="assistant_page_local_tools_subagent_desc">Let the AI delegate independent subtasks to isolated subagents and collect their reports</string>
+  <string name="assistant_page_local_tools_browser_title">Agent Browser</string>
+  <string name="assistant_page_local_tools_browser_desc">Read web pages in an off-screen browser, including JavaScript-rendered content, as a supplement to web search</string>
   <string name="assistant_page_local_tools_clipboard_desc">Read or write plain text from the device clipboard</string>
   <string name="assistant_page_local_tools_clipboard_title">Clipboard</string>
   <string name="assistant_page_local_tools_javascript_engine_desc">Execute JavaScript code with QuickJS engine for calculations and scripting</string>
@@ -1647,6 +1651,7 @@
   <string name="stats_page_source_suggestion">Suggestions</string>
   <string name="stats_page_source_translation">Translation</string>
   <string name="stats_page_source_memory">Memory</string>
+  <string name="stats_page_source_subagent">Subagent</string>
   <string name="stats_page_source_ocr">OCR</string>
   <string name="image_preview_saving">Saving…</string>
   <string name="image_preview_saved">Image saved</string>

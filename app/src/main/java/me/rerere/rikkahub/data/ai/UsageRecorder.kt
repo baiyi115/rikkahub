@@ -27,6 +27,7 @@ enum class UsageSource {
     SUGGESTION,
     TRANSLATION,
     MEMORY,
+    SUBAGENT,
     OCR,
 }
 

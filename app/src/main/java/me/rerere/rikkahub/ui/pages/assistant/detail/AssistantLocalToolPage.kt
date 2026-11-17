@@ -35,12 +35,14 @@ import me.rerere.hugeicons.stroke.Calendar03
 import me.rerere.hugeicons.stroke.ChartLineData01
 import me.rerere.hugeicons.stroke.ClipboardPaste
 import me.rerere.hugeicons.stroke.Clock01
+import me.rerere.hugeicons.stroke.GlobalSearch
 import me.rerere.hugeicons.stroke.JavaScript
 import me.rerere.hugeicons.stroke.Key01
 import me.rerere.hugeicons.stroke.MessageQuestion
 import me.rerere.hugeicons.stroke.ShieldCheck
 import me.rerere.hugeicons.stroke.SmartPhone01
 import me.rerere.hugeicons.stroke.Tap01
+import me.rerere.hugeicons.stroke.UserCircle
 import me.rerere.hugeicons.stroke.VolumeHigh
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.Screen
@@ -257,6 +259,18 @@ private fun AssistantLocalToolContent(
                 icon = HugeIcons.MessageQuestion,
                 title = R.string.assistant_page_local_tools_ask_user_title,
                 description = R.string.assistant_page_local_tools_ask_user_desc,
+            )
+            toolItem(
+                option = LocalToolOption.Subagent,
+                icon = HugeIcons.UserCircle,
+                title = R.string.assistant_page_local_tools_subagent_title,
+                description = R.string.assistant_page_local_tools_subagent_desc,
+            )
+            toolItem(
+                option = LocalToolOption.Browser,
+                icon = HugeIcons.GlobalSearch,
+                title = R.string.assistant_page_local_tools_browser_title,
+                description = R.string.assistant_page_local_tools_browser_desc,
             )
             toolItem(
                 option = LocalToolOption.ScreenTime,

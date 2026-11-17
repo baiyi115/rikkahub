@@ -74,6 +74,10 @@
   <string name="assistant_page_invalid_json">无效的 JSON: %s</string>
   <string name="assistant_page_local_tools_ask_user_desc">允许 AI 向你提问以获得更多信息</string>
   <string name="assistant_page_local_tools_ask_user_title">询问用户</string>
+  <string name="assistant_page_local_tools_subagent_title">子代理</string>
+  <string name="assistant_page_local_tools_subagent_desc">让 AI 把独立子任务交给隔离上下文的子代理执行，并收集它们的结论</string>
+  <string name="assistant_page_local_tools_browser_title">Agent 浏览器</string>
+  <string name="assistant_page_local_tools_browser_desc">用离屏浏览器读取网页（含需要 JavaScript 渲染的内容），作为网络搜索的补充</string>
   <string name="assistant_page_local_tools_clipboard_desc">读取或写入设备剪贴板中的纯文本</string>
   <string name="assistant_page_local_tools_clipboard_title">剪贴板</string>
   <string name="assistant_page_local_tools_javascript_engine_desc">使用 QuickJS 引擎执行 JavaScript 代码，进行计算和脚本处理</string>
@@ -1646,6 +1650,7 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="stats_page_source_suggestion">建议</string>
   <string name="stats_page_source_translation">翻译</string>
   <string name="stats_page_source_memory">记忆</string>
+  <string name="stats_page_source_subagent">子代理</string>
   <string name="stats_page_source_ocr">OCR</string>
   <string name="assistant_page_memory_empty">暂无记忆</string>
   <string name="assistant_page_memory_empty_hint">聊天时，助手会记住你告诉它的内容。你也可以点按 + 添加一条记忆</string>

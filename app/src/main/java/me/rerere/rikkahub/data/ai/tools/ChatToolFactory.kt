@@ -6,7 +6,9 @@ import kotlinx.serialization.json.jsonObject
 import me.rerere.ai.core.Tool
 import me.rerere.ai.provider.BuiltInTools
 import me.rerere.ai.provider.Model
+import me.rerere.ai.provider.ProviderManager
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.rikkahub.data.ai.UsageRecorder
 import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.ai.tools.local.LocalToolOption
 import me.rerere.rikkahub.data.ai.tools.local.LocalTools
@@ -47,6 +49,8 @@ class ChatToolFactory(
     private val skillManager: SkillManager,
     private val workspaceRepository: WorkspaceRepository,
     private val backgroundShellManager: BackgroundShellManager,
+    private val providerManager: ProviderManager,
+    private val usageRecorder: UsageRecorder,
 ) {
     suspend fun createTools(
         settings: Settings,
@@ -57,7 +61,7 @@ class ChatToolFactory(
     ): List<Tool> {
         val workspaceTools =
             createWorkspaceToolsIfReady(assistant.workspaceId?.toString(), workspaceCwd, conversationId)
-        val tools = buildList {
+        val baseTools = buildList {
             if (assistant.enableMemory) {
                 addAll(buildMemoryTools(memoryRepository, assistant.memoryId))
             }
@@ -105,6 +109,20 @@ class ChatToolFactory(
                     )
                 )
             }
+        }
+        // 子代理工具在完整工具集之后创建: 它拿到的是去掉自身和交互式工具的一份, 避免递归调用
+        val tools = if (LocalToolOption.Subagent in assistant.localTools) {
+            baseTools + createSubagentTool(
+                settings = settings,
+                assistant = assistant,
+                model = model,
+                conversationId = conversationId,
+                tools = baseTools,
+                providerManager = providerManager,
+                usageRecorder = usageRecorder,
+            )
+        } else {
+            baseTools
         }
         // 过长的输出存成文件让模型用 shell 按需读取；没有 shell 时模型读不到文件，只能原样返回
         val localShellEnabled = LocalToolOption.LocalShell in assistant.localTools

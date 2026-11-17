@@ -44,4 +44,12 @@ sealed class LocalToolOption {
     @Serializable
     @SerialName("local_shell")
     data object LocalShell : LocalToolOption()
+
+    @Serializable
+    @SerialName("browser")
+    data object Browser : LocalToolOption()
+
+    @Serializable
+    @SerialName("subagent")
+    data object Subagent : LocalToolOption()
 }
