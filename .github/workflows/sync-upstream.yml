@@ -1,9 +1,7 @@
 name: Sync Upstream
 
 on:
-  schedule:
-    # 每天 02:00 (Asia/Shanghai)
-    - cron: '0 18 * * *'
+  # 仅手动触发：在 Actions 页面选择 Sync Upstream -> Run workflow
   workflow_dispatch:
 
 permissions:
