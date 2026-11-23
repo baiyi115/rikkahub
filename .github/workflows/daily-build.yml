@@ -1,10 +1,7 @@
 name: Daily Build
 
 on:
-  # 每天 UTC 09:00、18:00 触发（北京时间 17:00、次日 02:00）
-  schedule:
-    - cron: '0 9,18 * * *'
-  # 也支持手动触发
+  # 仅手动触发：在 Actions 页面选择 Daily Build -> Run workflow
   workflow_dispatch:
 
 jobs:
@@ -104,7 +101,7 @@ jobs:
           name: Nightly Build
           prerelease: true
           body: |
-            自动每日构建（commit `${{ github.sha }}`）
+            手动触发的构建（commit `${{ github.sha }}`）
 
             > ⚠️ 开发版本，可能不稳定，仅供测试。
           # mapping.txt 用于还原混淆后的崩溃堆栈，所有 ABI 的 APK 共用这一份
