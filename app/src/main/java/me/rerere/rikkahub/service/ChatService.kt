@@ -49,6 +49,8 @@ import me.rerere.rikkahub.data.ai.TranslationHandler
 import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.ai.prompts.buildCompressPrompt
 import me.rerere.rikkahub.data.ai.tools.InvalidMcpServerNamesException
+import me.rerere.rikkahub.data.ai.tools.SubagentManager
+import me.rerere.rikkahub.data.ai.tools.SubagentNoticeEvent
 import me.rerere.rikkahub.data.ai.tools.local.LocalTools
 import me.rerere.rikkahub.data.ai.tools.shouldUseExternalWebSearch
 import me.rerere.rikkahub.data.datastore.SettingsStore
@@ -127,6 +129,7 @@ class ChatService(
     private val folderRepository: FolderRepository,
     private val backgroundShellManager: BackgroundShellManager,
     private val localTools: LocalTools,
+    private val subagentManager: SubagentManager,
 ) {
     /** 一次 agent 运行发给模型的消息，和回复要写进的节点 */
     private class ReplyTarget(val history: List<UIMessage>, val nodeId: Uuid) {
@@ -228,6 +231,14 @@ class ChatService(
                     is BackgroundShellNoticeEvent.Posted -> postNotice(event.conversationId, event.key, event.notice)
                     is BackgroundShellNoticeEvent.Withdrawn ->
                         sessionManager.get(event.conversationId)?.inbox?.withdraw(event.key)
+                }
+            }
+        }
+        // 后台子代理跑完时把结果投进收件箱: 主代理还在这一轮里就在下一步看到, 已经结束就开新一轮
+        appScope.launch {
+            subagentManager.noticeEvents.collect { event ->
+                when (event) {
+                    is SubagentNoticeEvent.Posted -> postNotice(event.conversationId, event.key, event.notice)
                 }
             }
         }
@@ -1411,6 +1422,8 @@ class ChatService(
         sessionManager.removeIfIdle(session)
         // 后台命令随会话一起终止, 撤销删除也不会恢复; 终止要等宽限期, 不阻塞删除
         appScope.launch { backgroundShellManager.killConversation(conversationId) }
+        // 后台子代理没有界面可以收回, 直接取消并清掉, 避免继续占着模型请求
+        subagentManager.closeConversation(conversationId)
     }
 
     suspend fun deleteConversationsOfAssistant(assistantId: Uuid) {

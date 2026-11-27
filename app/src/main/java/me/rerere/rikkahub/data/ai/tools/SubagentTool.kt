@@ -6,6 +6,7 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -45,7 +46,7 @@ private const val SUBAGENT_DEFAULT_TOKEN_BUDGET = 1_000_000
 private const val SUBAGENT_MAX_TOKEN_BUDGET = 4_000_000
 private const val SUBAGENT_MAX_TASK_CHARS = 16_000
 
-private class SubagentTokenBudgetExceededException :
+internal class SubagentTokenBudgetExceededException :
     RuntimeException("Subagent token budget exceeded")
 
 /** 子代理默认只读: 写文件和其它有副作用的工具需要主代理显式允许 */
@@ -67,6 +68,10 @@ private val SUBAGENT_SIDE_EFFECT_TOOLS = setOf(
  */
 private val SUBAGENT_EXCLUDED_TOOLS = setOf(
     SUBAGENT_TOOL_NAME,
+    SUBAGENT_SEND_TOOL_NAME,
+    SUBAGENT_WAIT_TOOL_NAME,
+    SUBAGENT_LIST_TOOL_NAME,
+    SUBAGENT_CLOSE_TOOL_NAME,
     "ask_user",
     "phone_use",
     "workspace_shell",
@@ -128,7 +133,7 @@ private fun Tool.withoutUserApproval(): Tool {
  *
  * 有的 Provider 只填 prompt/completion，totalTokens 留空，这时用两者之和兜底。
  */
-private fun UIMessage.tokenCount(): Int {
+internal fun UIMessage.tokenCount(): Int {
     val used = usage ?: return 0
     return used.totalTokens.takeIf { it > 0 } ?: (used.promptTokens + used.completionTokens)
 }
@@ -176,6 +181,7 @@ internal fun createSubagentTool(
     tools: List<Tool>,
     providerManager: ProviderManager,
     usageRecorder: UsageRecorder,
+    manager: SubagentManager,
 ): Tool {
     val readOnlyTools = subagentTools(tools)
     val sideEffectTools = subagentTools(tools, allowSideEffects = true)
@@ -185,7 +191,10 @@ internal fun createSubagentTool(
             Run a focused subagent with a fresh, isolated context to handle one subtask and return its report.
             Use it for self-contained work such as researching several sources, summarizing a long document,
             or exploring the workspace in an isolated context. Do not use it for a single quick lookup you can do
-            yourself. The call runs synchronously: you wait for the report.
+            yourself.
+            By default the call runs synchronously: you wait for the report. Set background=true to start the
+            subagent and keep working; you then get an agent_id, can redirect it with subagent_send while it runs,
+            and collect the report with subagent_wait.
             Put every known path, constraint and the expected output format in the task; the subagent starts with
             no conversation history. It is read-only by default: set allow_side_effects=true only when the subtask
             must modify files, change memory/calendar/clipboard, speak, run JavaScript or call MCP tools; that
@@ -206,6 +215,14 @@ internal fun createSubagentTool(
                     put("description", buildJsonObject {
                         put("type", "string")
                         put("description", "A short 3-5 word description of the subtask, used as the step title.")
+                    })
+                    put("background", buildJsonObject {
+                        put("type", "boolean")
+                        put(
+                            "description",
+                            "Start the subagent without waiting and return its agent_id. Use subagent_send to " +
+                                "redirect it and subagent_wait to collect the report. Defaults to false."
+                        )
                     })
                     put("allow_side_effects", buildJsonObject {
                         put("type", "boolean")
@@ -253,6 +270,7 @@ internal fun createSubagentTool(
                 "task is too long (${task.length} characters, max $SUBAGENT_MAX_TASK_CHARS)"
             }
             val allowSideEffects = subagentAllowSideEffects(args)
+            val background = args.jsonObject["background"]?.jsonPrimitive?.booleanOrNull == true
             val maxSteps = (args.jsonObject["max_steps"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
                 ?: SUBAGENT_MAX_STEPS).coerceIn(1, SUBAGENT_MAX_STEPS_LIMIT)
             val timeoutSeconds = (args.jsonObject["timeout_seconds"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
@@ -276,7 +294,6 @@ internal fun createSubagentTool(
                     append(tool.systemPrompt(model, listOf(UIMessage.user(task))))
                 }
             }
-            val messages = listOf(UIMessage.system(systemPrompt), UIMessage.user(task))
             val params = TextGenerationParams(
                 model = model,
                 temperature = assistant.temperature,
@@ -287,109 +304,160 @@ internal fun createSubagentTool(
                 customBody = assistant.customBodies + model.customBodies,
                 sessionId = conversationId.toString(),
             )
-            val hooks = object : AgentHooks {
-                override suspend fun prepareStep(messages: List<UIMessage>) = StepRequest(messages, params)
-            }
-            val request = AgentRequest(
-                provider = provider,
-                providerSetting = providerSetting,
-                messages = messages,
-                tools = nestedTools,
-                stream = false,
-                maxSteps = maxSteps,
-                retry = settings.retryPolicy(),
-            )
-            var finalMessage: UIMessage? = null
-            var finishReason: AgentFinishReason? = null
-            var timedOut = false
-            var budgetExceeded = false
-            var usedTokens = 0
-            var failure: Exception? = null
-            val startedAt = System.currentTimeMillis()
-            try {
-                withTimeout(timeoutSeconds * 1_000L) {
-                    runAgent(request, hooks).flowOn(Dispatchers.IO).collect { event ->
-                        when (event) {
-                            is AgentEvent.MessageUpdated -> {
-                                finalMessage = event.message
-                                usedTokens = maxOf(usedTokens, event.message.tokenCount())
-                                if (usedTokens > maxTotalTokens) {
-                                    throw SubagentTokenBudgetExceededException()
-                                }
-                            }
+            val description = args.jsonObject["description"]?.jsonPrimitive?.contentOrNull?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: task.lineSequence().first().take(60)
 
-                            is AgentEvent.Finished -> {
-                                // 已经结束的运行不再检查预算: 最后一步的回复本身就是结果
-                                finalMessage = event.message
-                                finishReason = event.reason
-                                usedTokens = maxOf(usedTokens, event.message.tokenCount())
-                            }
-
-                            is AgentEvent.Retrying -> Unit
-                        }
-                    }
+            if (background) {
+                val live = manager.liveCount(conversationId)
+                if (live >= SUBAGENT_MAX_LIVE) {
+                    error("too many live subagents ($live); close one with subagent_close first")
                 }
-            } catch (e: SubagentTokenBudgetExceededException) {
-                budgetExceeded = true
-            } catch (e: TimeoutCancellationException) {
-                timedOut = true
-            } catch (e: CancellationException) {
-                // 用户停止生成时必须向上传播, 不能当成子代理失败
-                throw e
-            } catch (e: Exception) {
-                failure = e
-            }
-            val report = finalMessage?.subagentReport().orEmpty()
-            val failureMessage = failure?.let { e ->
-                e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
-            }
-            // 嵌套调用没有单独的界面, 把调用过的工具名带回主对话, 至少能看出它做了什么
-            val toolTrace = finalMessage?.getTools()?.map { tool ->
-                buildJsonObject {
-                    put("tool", tool.toolName)
-                    put("executed", tool.isExecuted)
-                }
-            }
-            val payload = buildJsonObject {
-                put(
-                    "status",
-                    when {
-                        timedOut -> "timeout"
-                        budgetExceeded -> "token_limit_reached"
-                        failureMessage != null -> "failed"
-                        finishReason == AgentFinishReason.StepLimitReached -> "step_limit_reached"
-                        else -> "completed"
-                    }
+                val session = SubagentSession(
+                    id = Uuid.random().toString(),
+                    conversationId = conversationId,
+                    description = description,
+                    systemPrompt = systemPrompt,
+                    tools = nestedTools,
+                    params = params,
+                    provider = provider,
+                    providerSetting = providerSetting,
+                    retry = settings.retryPolicy(),
+                    maxSteps = maxSteps,
+                    timeoutSeconds = timeoutSeconds,
+                    maxTotalTokens = maxTotalTokens,
                 )
-                put(
-                    "result",
-                    report.ifBlank {
-                        when {
-                            timedOut -> "The subagent timed out before writing a final report."
-                            budgetExceeded ->
-                                "The subagent reached its token budget before writing a final report."
-
-                            failureMessage != null ->
-                                "The subagent failed before writing a final report: $failureMessage"
-
-                            finishReason == AgentFinishReason.StepLimitReached ->
-                                "The subagent reached its step limit before writing a final report."
-
-                            else -> "(the subagent produced no text output)"
-                        }
-                    }
-                )
-                failureMessage?.let { put("error", it) }
-                put("duration_ms", System.currentTimeMillis() - startedAt)
-                if (usedTokens > 0) put("tokens", usedTokens)
-                finalMessage?.stepCount?.let { put("steps", it) }
-                if (!toolTrace.isNullOrEmpty()) {
-                    put("tools", buildJsonArray { toolTrace.forEach { add(it) } })
+                manager.launch(session, task)
+                val payload = buildJsonObject {
+                    put("agent_id", session.id)
+                    put("description", description)
+                    put("status", "running")
+                    put(
+                        "note",
+                        "The subagent is running in the background. Use subagent_send to redirect it, " +
+                            "subagent_wait to collect its report, and subagent_close when it is no longer needed."
+                    )
                 }
+                listOf(UIMessagePart.Text(payload.toString()))
+            } else {
+                val request = AgentRequest(
+                    provider = provider,
+                    providerSetting = providerSetting,
+                    messages = listOf(UIMessage.system(systemPrompt), UIMessage.user(task)),
+                    tools = nestedTools,
+                    stream = false,
+                    maxSteps = maxSteps,
+                    retry = settings.retryPolicy(),
+                )
+                val payload = runSubagentOnce(request, params, timeoutSeconds, maxTotalTokens)
+                listOf(UIMessagePart.Text(payload.toString()))
             }
-            listOf(UIMessagePart.Text(payload.toString()))
         },
     )
+}
+
+/**
+ * 同步跑一次子代理并组装结果。
+ *
+ * 后台模式由 [SubagentManager] 负责同样的运行, 这里只服务默认的同步调用。
+ */
+private suspend fun runSubagentOnce(
+    request: AgentRequest,
+    params: TextGenerationParams,
+    timeoutSeconds: Long,
+    maxTotalTokens: Int,
+): JsonObject {
+    val hooks = object : AgentHooks {
+        override suspend fun prepareStep(messages: List<UIMessage>) = StepRequest(messages, params)
+    }
+    var finalMessage: UIMessage? = null
+    var finishReason: AgentFinishReason? = null
+    var timedOut = false
+    var budgetExceeded = false
+    var usedTokens = 0
+    var failure: Exception? = null
+    val startedAt = System.currentTimeMillis()
+    try {
+        withTimeout(timeoutSeconds * 1_000L) {
+            runAgent(request, hooks).flowOn(Dispatchers.IO).collect { event ->
+                when (event) {
+                    is AgentEvent.MessageUpdated -> {
+                        finalMessage = event.message
+                        usedTokens = maxOf(usedTokens, event.message.tokenCount())
+                        if (usedTokens > maxTotalTokens) {
+                            throw SubagentTokenBudgetExceededException()
+                        }
+                    }
+
+                    is AgentEvent.Finished -> {
+                        // 已经结束的运行不再检查预算: 最后一步的回复本身就是结果
+                        finalMessage = event.message
+                        finishReason = event.reason
+                        usedTokens = maxOf(usedTokens, event.message.tokenCount())
+                    }
+
+                    is AgentEvent.Retrying -> Unit
+                }
+            }
+        }
+    } catch (e: SubagentTokenBudgetExceededException) {
+        budgetExceeded = true
+    } catch (e: TimeoutCancellationException) {
+        timedOut = true
+    } catch (e: CancellationException) {
+        // 用户停止生成时必须向上传播, 不能当成子代理失败
+        throw e
+    } catch (e: Exception) {
+        failure = e
+    }
+    val report = finalMessage?.subagentReport().orEmpty()
+    val failureMessage = failure?.let { e ->
+        e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+    }
+    // 嵌套调用没有单独的界面, 把调用过的工具名带回主对话, 至少能看出它做了什么
+    val toolTrace = finalMessage?.getTools()?.map { tool ->
+        buildJsonObject {
+            put("tool", tool.toolName)
+            put("executed", tool.isExecuted)
+        }
+    }
+    return buildJsonObject {
+        put(
+            "status",
+            when {
+                timedOut -> "timeout"
+                budgetExceeded -> "token_limit_reached"
+                failureMessage != null -> "failed"
+                finishReason == AgentFinishReason.StepLimitReached -> "step_limit_reached"
+                else -> "completed"
+            }
+        )
+        put(
+            "result",
+            report.ifBlank {
+                when {
+                    timedOut -> "The subagent timed out before writing a final report."
+                    budgetExceeded ->
+                        "The subagent reached its token budget before writing a final report."
+
+                    failureMessage != null ->
+                        "The subagent failed before writing a final report: $failureMessage"
+
+                    finishReason == AgentFinishReason.StepLimitReached ->
+                        "The subagent reached its step limit before writing a final report."
+
+                    else -> "(the subagent produced no text output)"
+                }
+            }
+        )
+        failureMessage?.let { put("error", it) }
+        put("duration_ms", System.currentTimeMillis() - startedAt)
+        if (usedTokens > 0) put("tokens", usedTokens)
+        finalMessage?.stepCount?.let { put("steps", it) }
+        if (!toolTrace.isNullOrEmpty()) {
+            put("tools", buildJsonArray { toolTrace.forEach { add(it) } })
+        }
+    }
 }
 
 private const val SUBAGENT_SYSTEM_PROMPT =
@@ -397,5 +465,6 @@ private const val SUBAGENT_SYSTEM_PROMPT =
         "You start with no conversation history, so rely on the instructions you were given and inspect the environment with your tools. " +
         "You cannot ask the user questions, and tools that require user approval are unavailable. " +
         "If a tool returns APPROVAL_REQUIRED, do not call it again; choose another approach. " +
+        "The main agent may send you a message while you work; treat it as updated instructions and adjust. " +
         "Work autonomously, verify what you do, and finish with a concise report of findings and results " +
         "with concrete file paths, values or facts the main assistant can use."

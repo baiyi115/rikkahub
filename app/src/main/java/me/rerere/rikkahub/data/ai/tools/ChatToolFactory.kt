@@ -54,6 +54,9 @@ private val CONCURRENCY_SAFE_TOOL_NAMES = setOf(
     "conversation_read",
     "conversation_search",
     "use_skill",
+    // 只读的控制工具: 等待和查询不改变子代理状态, 可以和其它只读调用一起并发
+    SUBAGENT_WAIT_TOOL_NAME,
+    SUBAGENT_LIST_TOOL_NAME,
 )
 
 /**
@@ -93,6 +96,7 @@ class ChatToolFactory(
     private val backgroundShellManager: BackgroundShellManager,
     private val providerManager: ProviderManager,
     private val usageRecorder: UsageRecorder,
+    private val subagentManager: SubagentManager,
 ) {
     suspend fun createTools(
         settings: Settings,
@@ -159,15 +163,18 @@ class ChatToolFactory(
         // 子代理工具在完整工具集之后创建: 它拿到的是去掉自身和交互式工具的一份, 避免递归调用。
         // 嵌套工具先做子代理专用截断: 子代理读不到 /tool_outputs, 不能沿用主对话的落盘方案。
         val tools = if (LocalToolOption.Subagent in assistant.localTools) {
-            baseTools + createSubagentTool(
-                settings = settings,
-                assistant = assistant,
-                model = model,
-                conversationId = conversationId,
-                tools = baseTools.map { withSubagentOutputCap(it) },
-                providerManager = providerManager,
-                usageRecorder = usageRecorder,
-            )
+            baseTools +
+                createSubagentTool(
+                    settings = settings,
+                    assistant = assistant,
+                    model = model,
+                    conversationId = conversationId,
+                    tools = baseTools.map { withSubagentOutputCap(it) },
+                    providerManager = providerManager,
+                    usageRecorder = usageRecorder,
+                    manager = subagentManager,
+                ) +
+                createSubagentControlTools(subagentManager, conversationId)
         } else {
             baseTools
         }

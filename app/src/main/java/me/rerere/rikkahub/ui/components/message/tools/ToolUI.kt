@@ -27,6 +27,9 @@ import me.rerere.common.http.jsonObjectOrNull
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Tools
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.ai.tools.SUBAGENT_CLOSE_TOOL_NAME
+import me.rerere.rikkahub.data.ai.tools.SUBAGENT_LIST_TOOL_NAME
+import me.rerere.rikkahub.data.ai.tools.SUBAGENT_SEND_TOOL_NAME
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.ui.components.richtext.HighlightCodeBlock
 import me.rerere.rikkahub.ui.components.richtext.ZoomableAsyncImage
@@ -113,6 +116,10 @@ object ToolUIRegistry {
         LocalShellJobToolUI,
         PhoneUseToolUI,
         SubagentToolUI,
+        SubagentWaitToolUI,
+        SubagentControlToolUI(SUBAGENT_SEND_TOOL_NAME, R.string.tool_ui_subagent_send),
+        SubagentControlToolUI(SUBAGENT_LIST_TOOL_NAME, R.string.tool_ui_subagent_list),
+        SubagentControlToolUI(SUBAGENT_CLOSE_TOOL_NAME, R.string.tool_ui_subagent_close),
         TodoToolUI,
     ).plus(MemoryFileToolUI.all).associateBy { it.toolName }
 

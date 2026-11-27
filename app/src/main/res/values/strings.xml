@@ -1280,6 +1280,10 @@
   <string name="tool_ui_subagent_tools">Tool calls</string>
   <string name="tool_ui_subagent_tool_not_executed">not executed</string>
   <string name="tool_ui_subagent_empty">No report yet</string>
+  <string name="tool_ui_subagent_background">Running in background: %1$s</string>
+  <string name="tool_ui_subagent_send">Message to subagent</string>
+  <string name="tool_ui_subagent_list">Subagents</string>
+  <string name="tool_ui_subagent_close">Close subagent</string>
   <string name="tool_ui_todo">Plan</string>
   <string name="tool_ui_todo_title">Plan: %1$d/%2$d done</string>
   <string name="tool_ui_todo_current">Now: %1$s</string>

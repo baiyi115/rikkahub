@@ -8,6 +8,7 @@ import me.rerere.rikkahub.AppScope
 import me.rerere.rikkahub.data.ai.ChatRequestFactory
 import me.rerere.rikkahub.data.ai.tools.AgentBrowser
 import me.rerere.rikkahub.data.ai.tools.ChatToolFactory
+import me.rerere.rikkahub.data.ai.tools.SubagentManager
 import me.rerere.rikkahub.data.ai.tools.local.LocalTools
 import me.rerere.rikkahub.data.event.AppEventBus
 import me.rerere.rikkahub.phoneuse.PhoneUseManager
@@ -124,6 +125,7 @@ val appModule = module {
             backgroundShellManager = get(),
             providerManager = get(),
             usageRecorder = get(),
+            subagentManager = get(),
         )
     }
 
@@ -132,6 +134,10 @@ val appModule = module {
             context = get(),
             workspaceRepository = get(),
         )
+    }
+
+    single {
+        SubagentManager()
     }
 
     single {
@@ -162,6 +168,7 @@ val appModule = module {
             folderRepository = get(),
             backgroundShellManager = get(),
             localTools = get(),
+            subagentManager = get(),
         )
     }
 

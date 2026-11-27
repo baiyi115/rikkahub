@@ -1,5 +1,6 @@
 package me.rerere.rikkahub.ui.components.message.tools
 
+import androidx.annotation.StringRes
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -22,6 +23,7 @@ import me.rerere.common.http.jsonObjectOrNull
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.AiBrain01
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.ai.tools.SUBAGENT_WAIT_TOOL_NAME
 
 /**
  * 子代理: 摘要直接展示报告，详情展示任务、状态、耗时、工具调用和完整结果。
@@ -50,13 +52,22 @@ object SubagentToolUI : ToolUIRenderer {
     }
 
     override fun hasSummary(context: ToolUIContext): Boolean =
-        context.loading || result(context) != null || errorMessage(context) != null
+        context.loading || result(context) != null || errorMessage(context) != null ||
+            agentId(context) != null
 
     @Composable
     override fun Summary(context: ToolUIContext) {
         val report = result(context)
         if (report == null) {
-            if (context.loading) {
+            val agent = agentId(context)
+            if (agent != null) {
+                // 后台模式: 调用已经返回, 子代理还在跑, 这里只能给出句柄
+                Text(
+                    text = stringResource(R.string.tool_ui_subagent_background, agent),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else if (context.loading) {
                 Text(
                     text = stringResource(R.string.tool_ui_subagent_running),
                     style = MaterialTheme.typography.bodySmall,
@@ -221,6 +232,10 @@ object SubagentToolUI : ToolUIRenderer {
     private fun errorMessage(context: ToolUIContext): String? =
         context.content.getStringContent("error")?.takeIf { it.isNotBlank() }
 
+    /** 后台模式返回的句柄; 同步调用没有 */
+    private fun agentId(context: ToolUIContext): String? =
+        context.content.getStringContent("agent_id")?.takeIf { it.isNotBlank() }
+
     private fun toolTrace(context: ToolUIContext): List<Pair<String, Boolean>> =
         context.content?.jsonObjectOrNull?.get("tools")?.jsonArrayOrNull?.mapNotNull { item ->
             val name = item.getStringContent("tool") ?: return@mapNotNull null
@@ -230,4 +245,64 @@ object SubagentToolUI : ToolUIRenderer {
     private const val SUMMARY_MAX_CHARS = 600
     private const val SUMMARY_MAX_LINES = 8
     private const val PREVIEW_MAX_CHARS = 12_000
+}
+
+/** subagent_wait 的结果和同步 subagent 同构, 直接复用同一套渲染 */
+object SubagentWaitToolUI : ToolUIRenderer by SubagentToolUI {
+    override val toolName: String = SUBAGENT_WAIT_TOOL_NAME
+}
+
+/** subagent_send / subagent_list / subagent_close: 摘要展示发出的消息或目标 agent */
+internal class SubagentControlToolUI(
+    override val toolName: String,
+    @StringRes private val labelRes: Int,
+) : ToolUIRenderer {
+    override fun icon(context: ToolUIContext): ImageVector = HugeIcons.AiBrain01
+
+    @Composable
+    override fun title(context: ToolUIContext): String = stringResource(labelRes)
+
+    override fun hasSummary(context: ToolUIContext): Boolean = summary(context) != null
+
+    @Composable
+    override fun Summary(context: ToolUIContext) {
+        val text = summary(context) ?: return
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodySmall,
+            maxLines = 3,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+
+    @Composable
+    override fun Preview(context: ToolUIContext, onDismissRequest: () -> Unit) {
+        Column(
+            modifier = Modifier
+                .fillMaxHeight(0.8f)
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text(
+                text = stringResource(labelRes),
+                style = MaterialTheme.typography.headlineSmall,
+            )
+            SelectionContainer {
+                Text(
+                    text = summary(context) ?: context.arguments.toString(),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+        }
+    }
+
+    private fun summary(context: ToolUIContext): String? =
+        context.arguments.getStringContent("message")?.take(SUMMARY_MAX_CHARS)
+            ?: context.arguments.getStringContent("agent_id")
+
+    private companion object {
+        const val SUMMARY_MAX_CHARS = 400
+    }
 }
