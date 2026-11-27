@@ -64,6 +64,7 @@ internal fun createReadDocumentTool(
         Supports PDF, DOCX (Word), PPTX (PowerPoint), XLSX/XLSM (Excel), EPUB, and plain-text formats
         such as CSV, Markdown or JSON. Paths must be absolute; use ${layout.workspaceDir} for the workspace files area.
         Long documents are returned in slices: continue with offset while returned_chars is smaller than total_chars.
+        at_end is true once the offset reaches the end of the document; there is nothing more to read then.
         Legacy binary Office files (.doc, .xls, .ppt) are not supported; ask the user to save them in the newer format.
     """.trimIndent().replace("\n", " "),
     parameters = {
@@ -131,6 +132,11 @@ internal fun createReadDocumentTool(
             put("total_chars", text.length)
             put("returned_chars", slice.length)
             put("truncated", start + slice.length < text.length)
+            // 和 workspace_read_file 一致: 越过末尾时明确说读完了
+            put("at_end", start >= text.length)
+            if (start >= text.length) {
+                put("note", "offset is at or past the end of the document; there is nothing left to read")
+            }
             put("text", slice)
         }
         listOf(UIMessagePart.Text(payload.toString()))

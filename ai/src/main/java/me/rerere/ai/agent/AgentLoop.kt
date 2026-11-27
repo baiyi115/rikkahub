@@ -6,7 +6,9 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
 import kotlinx.serialization.json.buildJsonObject
@@ -27,6 +29,9 @@ import kotlin.time.TimeSource
 
 // 输出为空的工具会被当成没执行过，之后每一步都会再执行一次，所以换成占位文本
 private const val EMPTY_TOOL_OUTPUT = "(no output)"
+
+// 同时执行的只读工具上限: 一次打出几十个磁盘或网络请求在手机上反而更慢
+private const val MAX_CONCURRENT_TOOLS = 4
 
 private class StreamChunkHandlingException(override val cause: Throwable) : RuntimeException(cause)
 
@@ -226,10 +231,11 @@ internal class AgentLoop(
         }
         // 完成顺序不固定，用锁把消息更新串起来；每个结果仍然写回自己的 toolCallId
         val updateMutex = Mutex()
+        val permits = Semaphore(MAX_CONCURRENT_TOOLS.coerceAtMost(tools.size))
         coroutineScope {
             tools.map { tool ->
                 async {
-                    val output = execute(tool)
+                    val output = permits.withPermit { execute(tool) }
                     updateMutex.withLock {
                         updateTool(tool.toolCallId) {
                             it.copy(output = output, finishedAt = Clock.System.now())

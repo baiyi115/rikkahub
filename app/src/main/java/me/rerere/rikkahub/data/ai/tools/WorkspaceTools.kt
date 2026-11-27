@@ -28,6 +28,9 @@ import kotlin.uuid.Uuid
 private const val SHELL_TIMEOUT_MAX_SECONDS = 600L
 private const val MAX_READ_FILE_BYTES = 8L * 1024 * 1024
 
+// 分页读取缓存的上限: 再大的文件每次重读反而比占着内存划算
+private const val MAX_CACHED_FILE_BYTES = 2L * 1024 * 1024
+
 // 单次读取返回的字符数, 留出 JSON 字段的余量, 整段结果仍在工具输出上限之内
 private const val DEFAULT_FILE_READ_CHARS = 30_000
 private const val MIN_FILE_READ_CHARS = 256
@@ -104,67 +107,120 @@ private val IMAGE_EXTENSIONS = setOf(
 private fun String.isImagePath(): Boolean =
     substringAfterLast('.', "").lowercase() in IMAGE_EXTENSIONS
 
+/**
+ * 分页读取时同一份文件常被连续读好几次, 每次都整份读入再解码很浪费。
+ *
+ * 只缓存最近读过的这一份, 并用本地文件的大小和修改时间校验: shell 改过文件后缓存自然失效。
+ * 拿不到本地文件的工作区 (SSH) 无法校验, 就不缓存, 宁可重读也不返回过期内容。
+ */
+private class ReadFileCache {
+    private var path: String? = null
+    private var length: Long = 0
+    private var modified: Long = 0
+    private var text: String? = null
+
+    @Synchronized
+    fun get(path: String, file: File?): String? {
+        val cached = text ?: return null
+        if (file == null || path != this.path) return null
+        return cached.takeIf { file.length() == length && file.lastModified() == modified }
+    }
+
+    @Synchronized
+    fun put(path: String, file: File?, text: String) {
+        // 修改时间为 0 表示文件系统给不出时间戳, 无法判断有没有过期, 这种情况下不缓存
+        val stamp = file?.lastModified() ?: 0L
+        if (file == null || stamp == 0L || file.length() > MAX_CACHED_FILE_BYTES) {
+            this.text = null
+            return
+        }
+        this.path = path
+        this.length = file.length()
+        this.modified = stamp
+        this.text = text
+    }
+}
+
+private suspend fun ReadFileCache.load(
+    workspaceRepository: WorkspaceRepository,
+    workspaceId: String,
+    path: String,
+): String {
+    val hostFile = workspaceRepository.resolveAbsoluteFile(workspaceId, path)
+    get(path, hostFile)?.let { return it }
+    return workspaceRepository.readTextInRootfs(workspaceId, path).also { put(path, hostFile, it) }
+}
+
 private fun createReadFileTool(
     workspaceId: String,
     layout: WorkspaceLayout,
     needsApproval: (String) -> Boolean,
     workspaceRepository: WorkspaceRepository,
-) = Tool(
-    name = "workspace_read_file",
-    description = """
-        Read a file using the assistant's bound workspace Rootfs. Paths must be absolute inside Rootfs.
-        Use ${layout.workspaceDir} for the workspace files area.
-        Supports UTF-8 text files and image files (png, jpg, jpeg, gif, webp, bmp, svg, heic, heif, avif, ico).
-        Long files are returned in slices: continue with offset while truncated is true.
-        For PDF, DOCX, PPTX, XLSX and EPUB documents use workspace_read_document instead.
-    """.trimIndent().replace("\n", " "),
-    parameters = {
-        InputSchema.Obj(
-            properties = buildJsonObject {
-                putPathProperty(layout, required = true)
-                put("offset", buildJsonObject {
-                    put("type", "integer")
-                    put("description", "Start character offset in the file. Defaults to 0.")
-                })
-                put("max_chars", buildJsonObject {
-                    put("type", "integer")
-                    put(
-                        "description",
-                        "Characters to return. Default and maximum $DEFAULT_FILE_READ_CHARS."
-                    )
-                })
-            },
-            required = listOf("path"),
-        )
-    },
-    needsApproval = { needsApproval("workspace_read_file") },
-    execute = {
-        val params = it.jsonObject
-        val path = params.absolutePath("path")
-        if (path.isImagePath()) {
-            workspaceRepository.readImageInRootfs(workspaceId, path)
-        } else {
-            val text = workspaceRepository.readTextInRootfs(workspaceId, path)
-            val offset = (params.string("offset")?.toIntOrNull() ?: 0).coerceAtLeast(0)
-            val maxChars = (params.string("max_chars")?.toIntOrNull() ?: DEFAULT_FILE_READ_CHARS)
-                .coerceIn(MIN_FILE_READ_CHARS, DEFAULT_FILE_READ_CHARS)
-            val start = offset.coerceIn(0, text.length)
-            val slice = documentSlice(text, start, maxChars)
-            listOf(
-                UIMessagePart.Text(
-                    buildJsonObject {
-                        put("path", path)
-                        put("offset", start)
-                        put("total_chars", text.length)
-                        put("returned_chars", slice.length)
-                        put("truncated", start + slice.length < text.length)
-                        put("text", slice)
-                    }.toString()
-                )
+): Tool {
+    val readFileCache = ReadFileCache()
+    return Tool(
+        name = "workspace_read_file",
+        description = """
+            Read a file using the assistant's bound workspace Rootfs. Paths must be absolute inside Rootfs.
+            Use ${layout.workspaceDir} for the workspace files area.
+            Supports UTF-8 text files and image files (png, jpg, jpeg, gif, webp, bmp, svg, heic, heif, avif, ico).
+            Long files are returned in slices: continue with offset while truncated is true.
+            at_end is true once the offset reaches the end of the file; there is nothing more to read then.
+            For PDF, DOCX, PPTX, XLSX and EPUB documents use workspace_read_document instead.
+        """.trimIndent().replace("\n", " "),
+        parameters = {
+            InputSchema.Obj(
+                properties = buildJsonObject {
+                    putPathProperty(layout, required = true)
+                    put("offset", buildJsonObject {
+                        put("type", "integer")
+                        put("description", "Start character offset in the file. Defaults to 0.")
+                    })
+                    put("max_chars", buildJsonObject {
+                        put("type", "integer")
+                        put(
+                            "description",
+                            "Characters to return. Default and maximum $DEFAULT_FILE_READ_CHARS."
+                        )
+                    })
+                },
+                required = listOf("path"),
             )
-        }
-    },
-)
+        },
+        needsApproval = { needsApproval("workspace_read_file") },
+        execute = {
+            val params = it.jsonObject
+            val path = params.absolutePath("path")
+            if (path.isImagePath()) {
+                workspaceRepository.readImageInRootfs(workspaceId, path)
+            } else {
+                val text = readFileCache.load(workspaceRepository, workspaceId, path)
+                val offset = (params.string("offset")?.toIntOrNull() ?: 0).coerceAtLeast(0)
+                val maxChars = (params.string("max_chars")?.toIntOrNull() ?: DEFAULT_FILE_READ_CHARS)
+                    .coerceIn(MIN_FILE_READ_CHARS, DEFAULT_FILE_READ_CHARS)
+                val start = offset.coerceIn(0, text.length)
+                val slice = documentSlice(text, start, maxChars)
+                listOf(
+                    UIMessagePart.Text(
+                        buildJsonObject {
+                            put("path", path)
+                            put("offset", start)
+                            put("total_chars", text.length)
+                            put("returned_chars", slice.length)
+                            put("truncated", start + slice.length < text.length)
+                            // 越过末尾时明确告诉模型读完了, 否则它会拿着空 text 反复换 offset 重试
+                            put("at_end", start >= text.length)
+                            if (start >= text.length) {
+                                put("note", "offset is at or past the end of the file; there is nothing left to read")
+                            }
+                            put("text", slice)
+                        }.toString()
+                    )
+                )
+            }
+        },
+    )
+}
 
 private fun createWriteFileTool(
     workspaceId: String,

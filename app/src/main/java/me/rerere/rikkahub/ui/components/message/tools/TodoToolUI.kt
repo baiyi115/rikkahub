@@ -12,6 +12,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -40,7 +41,7 @@ object TodoToolUI : ToolUIRenderer {
 
     @Composable
     override fun title(context: ToolUIContext): String {
-        val items = items(context)
+        val items = rememberedItems(context)
         if (items.isEmpty()) return stringResource(R.string.tool_ui_todo)
         return stringResource(
             R.string.tool_ui_todo_title,
@@ -53,7 +54,7 @@ object TodoToolUI : ToolUIRenderer {
 
     @Composable
     override fun Summary(context: ToolUIContext) {
-        val items = items(context)
+        val items = rememberedItems(context)
         if (items.isEmpty()) return
         val current = items.firstOrNull { it.status == TodoStatus.IN_PROGRESS }
         Text(
@@ -70,7 +71,7 @@ object TodoToolUI : ToolUIRenderer {
 
     @Composable
     override fun Preview(context: ToolUIContext, onDismissRequest: () -> Unit) {
-        val items = items(context)
+        val items = rememberedItems(context)
         Column(
             modifier = Modifier
                 .fillMaxHeight(0.8f)
@@ -135,4 +136,9 @@ object TodoToolUI : ToolUIRenderer {
 
     private fun items(context: ToolUIContext): List<TodoItem> =
         parseTodoItems(context.arguments).orEmpty()
+
+    // 参数不变时不必在每次重组里重新解析一遍
+    @Composable
+    private fun rememberedItems(context: ToolUIContext): List<TodoItem> =
+        remember(context.arguments) { parseTodoItems(context.arguments).orEmpty() }
 }

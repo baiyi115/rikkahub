@@ -62,6 +62,18 @@ class TodoToolTest {
     }
 
     @Test
+    fun `error names the offending item`() = runBlocking {
+        val error = runCatching {
+            buildTodoTool().execute(args("read the file" to "pending", "run tests" to "started"))
+        }.exceptionOrNull()
+
+        assertEquals(
+            "item 2 has unknown status \"started\"; use pending, in_progress or completed",
+            error?.message,
+        )
+    }
+
+    @Test
     fun `an empty list clears the plan`() = runBlocking {
         val output = buildTodoTool().execute(args())
 

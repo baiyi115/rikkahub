@@ -56,7 +56,9 @@ data class McpTool(
     val name: String = "",
     val description: String? = null,
     val inputSchema: InputSchema? = null,
-    val needsApproval: Boolean = false
+    val needsApproval: Boolean = false,
+    /** 服务端声明的只读工具, 连续调用时可以并发执行 */
+    val readOnly: Boolean = false
 )
 
 @Serializable

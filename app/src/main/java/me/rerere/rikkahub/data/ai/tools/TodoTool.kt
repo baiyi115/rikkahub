@@ -62,6 +62,25 @@ internal fun parseTodoItems(args: JsonElement): List<TodoItem>? {
     return items
 }
 
+/** 解析失败时指出第一个有问题的条目，模型照着报错就能改对，不用猜格式 */
+private fun describeTodoArgs(args: JsonElement): String {
+    val array = args.jsonObjectOrNull?.get("items")?.jsonArrayOrNull
+        ?: return "items must be an array of {content, status}"
+    array.forEachIndexed { index, element ->
+        val item = element as? JsonObject
+            ?: return "item ${index + 1} must be an object with content and status"
+        if (((item["content"] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()).isEmpty()) {
+            return "item ${index + 1} needs a non-empty content"
+        }
+        val raw = (item["status"] as? JsonPrimitive)?.contentOrNull
+        if (todoStatusOf(raw) == null) {
+            return "item ${index + 1} has unknown status \"${raw.orEmpty()}\"; " +
+                "use pending, in_progress or completed"
+        }
+    }
+    return "items must be an array of {content, status}"
+}
+
 /** 计划里最多允许一个进行中的条目；多出来的降级为待办，并在结果里说明 */
 private fun normalizeTodoItems(items: List<TodoItem>): Pair<List<TodoItem>, Boolean> {
     var seenInProgress = false
@@ -141,8 +160,7 @@ internal fun buildTodoTool(): Tool = Tool(
             "item in_progress, and mark each item completed as soon as it is done. The user sees this list."
     },
     execute = { args ->
-        val items = parseTodoItems(args)
-            ?: error("items must be an array of {content, status}, status is pending, in_progress or completed")
+        val items = parseTodoItems(args) ?: error(describeTodoArgs(args))
         require(items.size <= MAX_TODO_ITEMS) {
             "too many items (${items.size}, max $MAX_TODO_ITEMS)"
         }

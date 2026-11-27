@@ -147,6 +147,8 @@ class ChatToolFactory(
                         description = tool.description ?: "",
                         parameters = { tool.inputSchema },
                         needsApproval = { tool.needsApproval },
+                        // 服务端用 readOnlyHint 声明的工具不共享可变状态, 可以和其它只读调用一起并发
+                        isConcurrencySafe = { tool.readOnly },
                         execute = { mcpManager.callTool(serverId, tool.name, it.jsonObject) },
                     )
                 )

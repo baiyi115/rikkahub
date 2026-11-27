@@ -2,6 +2,7 @@ package me.rerere.ai.agent
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
@@ -34,6 +35,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicInteger
 
 class AgentLoopTest {
     private val model = Model(modelId = "test-model")
@@ -292,6 +294,34 @@ class AgentLoopTest {
 
         assertEquals("read-a done", finished.message.tool("call-1").outputText())
         assertEquals("read-b done", finished.message.tool("call-2").outputText())
+    }
+
+    @Test
+    fun `concurrent batches are capped`() = runTest {
+        val active = AtomicInteger()
+        val peak = AtomicInteger()
+        val tools = (1..6).map { index ->
+            tool("read-$index", isConcurrencySafe = true) {
+                val now = active.incrementAndGet()
+                peak.updateAndGet { maxOf(it, now) }
+                delay(100)
+                active.decrementAndGet()
+                ok()
+            }
+        }
+        provider.stream {
+            (1..6).forEach { index -> toolCall("call-$index", "read-$index") }
+            finish()
+        }
+        provider.stream {
+            text("ok")
+            finish()
+        }
+
+        runToEnd(request(tools = tools)).finished()
+
+        // 一次打出六个只读调用时不会同时开六个请求, 但确实并发了
+        assertTrue(peak.get() in 2..4)
     }
 
     @Test
