@@ -1,7 +1,12 @@
 package me.rerere.ai.agent
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.FlowCollector
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
 import kotlinx.serialization.json.buildJsonObject
@@ -172,17 +177,66 @@ internal class AgentLoop(
         return generated
     }
 
-    // 按调用顺序逐个执行，每执行完一个就更新一次，中途取消时已经执行的结果不会丢
+    // 只读工具连续出现时并发执行；遇到有副作用的工具就等这一批结束，保持调用顺序的语义。
+    // 每个工具执行完就更新一次，中途取消时已经执行的结果不会丢。
     private suspend fun executeTools() {
         val tools = checkNotNull(message).getTools().filter { !it.isExecuted }
-        for (tool in tools) {
-            // 只给真正运行的工具计时；开始时先写一次，界面才能在执行中实时显示耗时
-            val runs = tool.approvalState == ToolApprovalState.Auto || tool.approvalState == ToolApprovalState.Approved
-            if (runs) updateTool(tool.toolCallId) { it.copy(startedAt = Clock.System.now(), finishedAt = null) }
-            val output = execute(tool)
-            updateTool(tool.toolCallId) {
-                it.copy(output = output, finishedAt = if (runs) Clock.System.now() else it.finishedAt)
+        var index = 0
+        while (index < tools.size) {
+            val tool = tools[index]
+            if (!canRunConcurrently(tool)) {
+                executeSequentially(tool)
+                index++
+                continue
             }
+            val batch = mutableListOf(tool)
+            var next = index + 1
+            while (next < tools.size && canRunConcurrently(tools[next])) {
+                batch += tools[next]
+                next++
+            }
+            if (batch.size == 1) {
+                executeSequentially(tool)
+            } else {
+                executeConcurrently(batch)
+            }
+            index = next
+        }
+    }
+
+    private fun canRunConcurrently(tool: UIMessagePart.Tool): Boolean {
+        val runs = tool.approvalState == ToolApprovalState.Auto || tool.approvalState == ToolApprovalState.Approved
+        return runs && findTool(tool.toolName)?.isConcurrencySafe?.invoke(tool.inputAsJson()) == true
+    }
+
+    private suspend fun executeSequentially(tool: UIMessagePart.Tool) {
+        // 只给真正运行的工具计时；开始时先写一次，界面才能在执行中实时显示耗时
+        val runs = tool.approvalState == ToolApprovalState.Auto || tool.approvalState == ToolApprovalState.Approved
+        if (runs) updateTool(tool.toolCallId) { it.copy(startedAt = Clock.System.now(), finishedAt = null) }
+        val output = execute(tool)
+        updateTool(tool.toolCallId) {
+            it.copy(output = output, finishedAt = if (runs) Clock.System.now() else it.finishedAt)
+        }
+    }
+
+    private suspend fun executeConcurrently(tools: List<UIMessagePart.Tool>) {
+        val startedAt = Clock.System.now()
+        tools.forEach { tool ->
+            updateTool(tool.toolCallId) { it.copy(startedAt = startedAt, finishedAt = null) }
+        }
+        // 完成顺序不固定，用锁把消息更新串起来；每个结果仍然写回自己的 toolCallId
+        val updateMutex = Mutex()
+        coroutineScope {
+            tools.map { tool ->
+                async {
+                    val output = execute(tool)
+                    updateMutex.withLock {
+                        updateTool(tool.toolCallId) {
+                            it.copy(output = output, finishedAt = Clock.System.now())
+                        }
+                    }
+                }
+            }.awaitAll()
         }
     }
 
@@ -217,7 +271,11 @@ internal class AgentLoop(
         // 取消必须向上传播，否则停止生成会被误报为工具执行错误
         throw e
     } catch (e: Throwable) {
-        errorOutput("[${e.javaClass.name}] ${e.message}\n${e.stackTraceToString()}")
+        // 只把异常类型、消息和首个栈帧交给模型; 完整栈帧对模型没有帮助, 还会占用大量上下文
+        val frame = e.stackTrace.firstOrNull()?.let {
+            " at ${it.className}.${it.methodName}(${it.fileName}:${it.lineNumber})"
+        }.orEmpty()
+        errorOutput("[${e.javaClass.simpleName}] ${e.message ?: "Tool execution failed"}$frame")
     }
 
     private fun findTool(name: String) = request.tools.find { it.name == name }

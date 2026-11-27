@@ -89,9 +89,15 @@ data class WorkspaceLayout(
         }
     }
 
-    /** 文件区内的绝对路径转成相对文件区的路径, 不在文件区内时原样返回 */
-    fun relativeToWorkspace(path: String): String =
-        path.removePrefix("$workspaceDir/").removePrefix(workspaceDir)
+    /** 文件区内的绝对路径转成相对文件区的路径, 不在文件区内时原样返回 (去掉首尾空白) */
+    fun relativeToWorkspace(path: String): String {
+        val trimmed = path.trim()
+        return when {
+            trimmed == workspaceDir -> ""
+            trimmed.startsWith("$workspaceDir/") -> trimmed.removePrefix("$workspaceDir/")
+            else -> trimmed
+        }
+    }
 
     /** 按最长匹配的目录判断: 例如 /a 免审批、/a/b 需审批时, /a/b 下的路径需要审批 */
     fun isWritable(path: String): Boolean {

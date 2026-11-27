@@ -15,6 +15,11 @@ data class Tool(
     val parameters: () -> InputSchema? = { null },
     val systemPrompt: (model: Model, messages: List<UIMessage>) -> String = { _, _ -> "" },
     val needsApproval: (JsonElement) -> Boolean = { false },
+    /**
+     * 这次调用能否和其它只读调用并发执行。只读、不共享可变状态的工具才应返回 true;
+     * AgentLoop 只会把连续的可并发调用放在同一批里，遇到其它工具就等这一批结束。
+     */
+    val isConcurrencySafe: (JsonElement) -> Boolean = { false },
     val execute: suspend (JsonElement) -> List<UIMessagePart>
 )
 

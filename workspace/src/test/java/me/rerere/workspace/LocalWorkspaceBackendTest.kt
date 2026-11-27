@@ -54,6 +54,7 @@ class LocalWorkspaceBackendTest {
         assertEquals("", layout.relativeToWorkspace("/workspace"))
         assertEquals("src", layout.relativeToWorkspace("/workspace/src"))
         assertEquals("src", layout.relativeToWorkspace("src"))
+        assertEquals("/workspacefoo", layout.relativeToWorkspace("/workspacefoo"))
     }
 
     @Test

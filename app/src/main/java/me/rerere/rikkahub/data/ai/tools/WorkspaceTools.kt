@@ -41,6 +41,21 @@ val WorkspaceFileWriteToolNames: Set<String> = setOf("workspace_write_file", "wo
 fun resolveWorkspaceToolApproval(name: String, overrides: Map<String, Boolean>): Boolean =
     overrides[name] ?: WorkspaceToolDefaultApprovals[name] ?: false
 
+/**
+ * shell 的 cwd 只接受文件区内的路径。
+ *
+ * 宿主机校验和 PRoot 的 cwd 映射方式不同: 前者把路径当 filesDir 下的相对路径,
+ * 后者会拼到 /workspace 下。这里先把绝对路径归一化, 并拒绝 .. 逃逸,
+ * 避免命令在校验过的目录之外执行。
+ */
+internal fun workspaceCwd(layout: WorkspaceLayout, path: String): String {
+    val relative = layout.relativeToWorkspace(path)
+    require(relative.isEmpty() || (!relative.startsWith("/") && relative.split('/').none { it == ".." })) {
+        "cwd must stay inside the workspace files root: $path"
+    }
+    return relative
+}
+
 suspend fun createWorkspaceTools(
     workspaceId: String?,
     workspaceRepository: WorkspaceRepository,
@@ -55,7 +70,8 @@ suspend fun createWorkspaceTools(
     val approvalOverrides = workspace.toolApprovalOverrides()
     fun needsApproval(name: String) = resolveWorkspaceToolApproval(name, approvalOverrides)
 
-    val shellCwd = cwd?.let(layout::relativeToWorkspace)
+    // 会话里保存的默认 cwd 可能来自旧版本或已失效的路径; 不在建工具时抛错, 回退到文件区根目录
+    val shellCwd = cwd?.let { runCatching { workspaceCwd(layout, it) }.getOrNull() }
     // 后台命令按会话归属, 没有会话时不提供
     val background = backgroundShellManager
         ?.takeIf { workspace.capabilities().backgroundShell }
@@ -315,7 +331,7 @@ private fun createShellTool(
     execute = {
         val params = it.jsonObject
         val command = params.string("command") ?: error("command is required")
-        val cwd = layout.relativeToWorkspace(params.string("cwd") ?: defaultCwd.orEmpty())
+        val cwd = workspaceCwd(layout, params.string("cwd") ?: defaultCwd.orEmpty())
         val runInBackground = params.string("run_in_background")?.toBooleanStrictOrNull() ?: false
         val output = if (runInBackground && background != null) {
             background.manager.start(background.conversationId, workspaceId, command, cwd).toJson()

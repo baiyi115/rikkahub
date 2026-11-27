@@ -8,7 +8,10 @@ import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -259,6 +262,69 @@ class AgentLoopTest {
         // 开始执行时就写入了 startedAt，界面能实时计时
         assertNotNull(last.tool("call-2").startedAt)
         assertNull(last.tool("call-2").finishedAt)
+    }
+
+    @Test
+    fun `concurrency safe tools run in parallel`() = runTest {
+        val bothStarted = CompletableDeferred<Unit>()
+        val lock = Mutex()
+        var started = 0
+        fun safe(name: String) = tool(name, isConcurrencySafe = true) {
+            lock.withLock {
+                started++
+                if (started == 2) bothStarted.complete(Unit)
+            }
+            withTimeout(5_000) { bothStarted.await() }
+            listOf(UIMessagePart.Text("$name done"))
+        }
+        val tools = listOf(safe("read-a"), safe("read-b"))
+        provider.stream {
+            toolCall("call-1", "read-a")
+            toolCall("call-2", "read-b")
+            finish()
+        }
+        provider.stream {
+            text("ok")
+            finish()
+        }
+
+        val finished = runToEnd(request(tools = tools)).finished()
+
+        assertEquals("read-a done", finished.message.tool("call-1").outputText())
+        assertEquals("read-b done", finished.message.tool("call-2").outputText())
+    }
+
+    @Test
+    fun `a side effect tool splits the concurrent batches`() = runTest {
+        val writeFinished = CompletableDeferred<Unit>()
+        var readBStartedAfterWrite = false
+        val tools = listOf(
+            tool("read-a", isConcurrencySafe = true) { ok() },
+            tool("write") {
+                writeFinished.complete(Unit)
+                ok()
+            },
+            tool("read-b", isConcurrencySafe = true) {
+                readBStartedAfterWrite = writeFinished.isCompleted
+                ok()
+            },
+        )
+        provider.stream {
+            toolCall("call-1", "read-a")
+            toolCall("call-2", "write")
+            toolCall("call-3", "read-b")
+            finish()
+        }
+        provider.stream {
+            text("ok")
+            finish()
+        }
+
+        val finished = runToEnd(request(tools = tools)).finished()
+
+        // read-b 不能和 read-a 一起跑到 write 前面: 有副作用的工具必须等前面这一批结束
+        assertTrue(readBStartedAfterWrite)
+        assertTrue(finished.message.getTools().all { it.isExecuted })
     }
 
     @Test
@@ -702,8 +768,15 @@ private suspend fun FlowCollector<StreamChunk>.finish() {
 private fun tool(
     name: String,
     needsApproval: Boolean = false,
+    isConcurrencySafe: Boolean = false,
     execute: suspend (JsonElement) -> List<UIMessagePart> = { ok() },
-) = Tool(name = name, description = name, needsApproval = { needsApproval }, execute = execute)
+) = Tool(
+    name = name,
+    description = name,
+    needsApproval = { needsApproval },
+    isConcurrencySafe = { isConcurrencySafe },
+    execute = execute,
+)
 
 private fun ok() = listOf(UIMessagePart.Text("ok"))
 

@@ -129,6 +129,7 @@ class BackgroundShellManager(
 
     private val handles = ConcurrentHashMap<String, Handle>()
     private val readMutex = Mutex()
+    private val capacityMutex = Mutex()
 
     private val _tasks = MutableStateFlow<Map<String, BackgroundShellTask>>(emptyMap())
     val tasks: StateFlow<Map<String, BackgroundShellTask>> = _tasks.asStateFlow()
@@ -139,16 +140,17 @@ class BackgroundShellManager(
     fun tasksOf(conversationId: Uuid): List<BackgroundShellTask> =
         _tasks.value.values.filter { it.conversationId == conversationId }.sortedBy { it.startedAt }
 
+    // 名额检查和 register 必须在同一把锁内: 否则并发启动会同时通过检查, 超过每会话上限
     suspend fun start(
         conversationId: Uuid,
         workspaceId: String,
         command: String,
         cwd: String,
-    ): BackgroundShellTask {
+    ): BackgroundShellTask = capacityMutex.withLock {
         requireCapacity(conversationId)
         val id = newId()
         val backgroundCommand = workspaceRepository.startBackgroundCommand(workspaceId, command, cwd, id)
-        return register(conversationId, workspaceId, command, id, backgroundCommand)
+        register(conversationId, workspaceId, command, id, backgroundCommand)
     }
 
     suspend fun startLocal(
@@ -157,7 +159,7 @@ class BackgroundShellManager(
         command: String,
         cwd: String?,
         root: Boolean,
-    ): BackgroundShellTask {
+    ): BackgroundShellTask = capacityMutex.withLock {
         requireCapacity(conversationId)
         val id = newId()
         var started: WorkspaceBackgroundCommand? = null
@@ -165,7 +167,7 @@ class BackgroundShellManager(
             val backgroundCommand = runInterruptible(Dispatchers.IO) {
                 runner.startBackgroundCommand(command, cwd, root, id).also { started = it }
             }
-            return register(conversationId, LOCAL_SHELL_WORKSPACE_ID, command, id, backgroundCommand)
+            register(conversationId, LOCAL_SHELL_WORKSPACE_ID, command, id, backgroundCommand)
         } catch (e: Throwable) {
             withContext(NonCancellable + Dispatchers.IO) { started?.kill() }
             throw e

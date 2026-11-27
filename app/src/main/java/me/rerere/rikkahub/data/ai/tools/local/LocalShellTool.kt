@@ -299,8 +299,8 @@ private suspend fun execInLocalShell(
     identity: String,
     timeoutMillis: Long,
 ): List<UIMessagePart> {
-    val command = params.stringValue("command").orEmpty().trim()
-    if (command.isEmpty()) return localShellError("command is required for action=exec")
+    val command = params.stringValue("command").orEmpty()
+    if (command.isBlank()) return localShellError("command is required for action=exec")
     val sessionId = params.stringValue("session_id")
     val cwd = params.stringValue("cwd")
 
@@ -399,8 +399,8 @@ private suspend fun executeLocalShellJobTool(
     return try {
         when (action) {
             "start" -> {
-                val command = params.stringValue("command").orEmpty().trim()
-                if (command.isEmpty()) {
+                val command = params.stringValue("command").orEmpty()
+                if (command.isBlank()) {
                     localShellError("command is required for action=start")
                 } else {
                     val task = manager.startLocal(
@@ -410,8 +410,14 @@ private suspend fun executeLocalShellJobTool(
                         cwd = params.stringValue("cwd"),
                         root = identity == "root",
                     )
-                    listOf(UIMessagePart.Text(task.toJobJson(extra = { put("ok", true); put("action", "start") })
-                        .toString()))
+                    listOf(
+                        UIMessagePart.Text(
+                            task.toJobJson(extra = {
+                                put("ok", true)
+                                put("action", "start")
+                            }).toString()
+                        )
+                    )
                 }
             }
 
