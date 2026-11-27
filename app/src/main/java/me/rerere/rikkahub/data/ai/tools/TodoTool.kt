@@ -141,9 +141,8 @@ internal fun buildTodoTool(): Tool = Tool(
                             put("status", buildJsonObject {
                                 put("type", "string")
                                 put("enum", buildJsonArray {
-                                    add("pending")
-                                    add("in_progress")
-                                    add("completed")
+                                    // 与解析器共用同一份状态定义，避免两处字面量写岔
+                                    TodoStatus.entries.forEach { add(JsonPrimitive(it.name.lowercase())) }
                                 })
                             })
                             put("active_form", buildJsonObject {
@@ -156,8 +155,8 @@ internal fun buildTodoTool(): Tool = Tool(
                             })
                         })
                         put("required", buildJsonArray {
-                            add("content")
-                            add("status")
+                            add(JsonPrimitive("content"))
+                            add(JsonPrimitive("status"))
                         })
                     })
                 })
