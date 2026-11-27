@@ -1,23 +1,25 @@
 package me.rerere.rikkahub.data.ai.tools
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ToolOutputPreviewTest {
     @Test
     fun `short output is unchanged`() {
-        assertEquals("hello", toolOutputPreview("hello", 10))
+        assertEquals("hello\nworld", toolOutputPreview(listOf("hello", "world"), 20))
     }
 
     @Test
     fun `long output keeps head and tail`() {
-        val text = "A".repeat(100) + "B".repeat(100)
+        val texts = listOf("start", "A".repeat(100), "", "end")
+        val joined = texts.joinToString("\n")
+        val limit = 21
+        val head = limit / 2
+        val tail = limit - head
 
-        val preview = toolOutputPreview(text, 40)
-
-        assertTrue(preview.startsWith("A".repeat(20)))
-        assertTrue(preview.endsWith("B".repeat(20)))
-        assertTrue(preview.contains("characters omitted"))
+        assertEquals(
+            "${joined.take(head)}\n... [${joined.length - limit} characters omitted] ...\n${joined.takeLast(tail)}",
+            toolOutputPreview(texts, limit),
+        )
     }
 }

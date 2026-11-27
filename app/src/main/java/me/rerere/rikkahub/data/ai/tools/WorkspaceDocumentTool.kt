@@ -21,6 +21,9 @@ private const val MAX_DOCUMENT_BYTES = 64L * 1024 * 1024
 private const val DEFAULT_DOCUMENT_CHARS = 12_000
 private const val MAX_DOCUMENT_CHARS = 60_000
 
+// Binary document parsers can load the entire file and decoded streams at once.
+private val documentParserDispatcher = Dispatchers.IO.limitedParallelism(2)
+
 internal enum class DocumentFormat { PDF, DOCX, PPTX, XLSX, EPUB, TEXT, LEGACY_OFFICE, UNSUPPORTED }
 
 private val TEXT_DOCUMENT_EXTENSIONS = setOf(
@@ -40,6 +43,8 @@ internal fun documentFormatOf(path: String): DocumentFormat =
         else -> DocumentFormat.UNSUPPORTED
     }
 
+internal data class WorkspaceTextPage(val json: String, val hasMore: Boolean)
+
 /** Return the largest requested prefix that fits after JSON escaping and pagination metadata. */
 internal fun workspaceTextPage(
     path: String,
@@ -48,7 +53,7 @@ internal fun workspaceTextPage(
     maxChars: Int,
     maxOutputChars: Int,
     format: DocumentFormat? = null,
-): String {
+): WorkspaceTextPage {
     fun beforePair(index: Int): Int =
         if (index in 1 until text.length && text[index - 1].isHighSurrogate() && text[index].isLowSurrogate()) {
             index - 1
@@ -57,7 +62,7 @@ internal fun workspaceTextPage(
         }
 
     val start = beforePair(offset.coerceIn(0, text.length))
-    fun encode(end: Int): String = buildJsonObject {
+    fun encode(end: Int, content: String): String = buildJsonObject {
         put("path", path)
         format?.let { put("format", it.name.lowercase()) }
         put("offset", start)
@@ -69,31 +74,59 @@ internal fun workspaceTextPage(
         if (start == text.length) {
             put("note", "offset is at or past the end; there is nothing left to read")
         }
-        put("text", text.substring(start, end))
+        put("text", content)
     }.toString()
 
-    // A one-unit request starting at a surrogate pair must still make progress.
-    val firstEnd = if (start == text.length) start else start + Character.charCount(text.codePointAt(start))
-    val requestedEnd = beforePair(start + minOf(maxChars, text.length - start)).coerceAtLeast(firstEnd)
-    val full = encode(requestedEnd)
-    if (full.length <= maxOutputChars) return full
-
-    var best = encode(firstEnd)
-    require(best.length <= maxOutputChars) { "Workspace read path leaves too little room for a page of text" }
-    var lower = firstEnd + 1
-    var upper = requestedEnd - 1
-    // The full candidate was already tried. All remaining candidates have continuation metadata.
-    while (lower <= upper) {
-        val mid = lower + (upper - lower) / 2
-        val candidate = encode(beforePair(mid))
-        if (candidate.length <= maxOutputChars) {
-            best = candidate
-            lower = mid + 1
-        } else {
-            upper = mid - 1
-        }
+    if (start == text.length) {
+        val json = encode(start, "")
+        require(json.length <= maxOutputChars) { PAGE_BUDGET_ERROR }
+        return WorkspaceTextPage(json, hasMore = false)
     }
-    return best
+    val header = encode(start, "").length
+
+    // A one-unit request starting at a surrogate pair must still make progress.
+    val firstEnd = start + Character.charCount(text.codePointAt(start))
+    val requestedEnd = beforePair(start + minOf(maxChars, text.length - start)).coerceAtLeast(firstEnd)
+    // Derive fixed overhead from the serializer. Only the two decimal fields grow within a page.
+    val continuationBudget = maxOutputChars - (header - 1 - start.decimalLength())
+    val finalBudget = if (requestedEnd == text.length) maxOutputChars - encode(requestedEnd, "").length else -1
+    var escapedLength = 0
+    var end = start
+    var bestEnd = start
+    while (end < requestedEnd) {
+        val width = Character.charCount(text.codePointAt(end))
+        escapedLength += if (width == 2) 2 else text[end].jsonEscapedLength()
+        end += width
+        val budget = if (end == text.length) finalBudget
+        else continuationBudget - (end - start).decimalLength() - end.decimalLength()
+        if (escapedLength <= budget) bestEnd = end
+        // The final page can fit even after a continuation stops fitting, as it has no next_offset.
+        if (escapedLength > budget && escapedLength > finalBudget) break
+    }
+    require(bestEnd >= firstEnd) { PAGE_BUDGET_ERROR }
+    return WorkspaceTextPage(encode(bestEnd, text.substring(start, bestEnd)), hasMore = bestEnd < text.length)
+}
+
+private const val PAGE_BUDGET_ERROR = "Workspace read path leaves too little room for a page of text"
+
+// Length in the compact kotlinx.serialization JSON output, excluding the surrounding quotes.
+private fun Char.jsonEscapedLength(): Int = when (this) {
+    '\\', '"', '\b', '\t', '\n', '\u000C', '\r' -> 2
+    in '\u0000'..'\u001F' -> 6
+    else -> 1
+}
+
+private fun Int.decimalLength(): Int = when {
+    this < 10 -> 1
+    this < 100 -> 2
+    this < 1_000 -> 3
+    this < 10_000 -> 4
+    this < 100_000 -> 5
+    this < 1_000_000 -> 6
+    this < 10_000_000 -> 7
+    this < 100_000_000 -> 8
+    this < 1_000_000_000 -> 9
+    else -> 10
 }
 
 /**
@@ -174,7 +207,7 @@ internal fun createReadDocumentTool(
             )
         }
         val page = workspaceTextPage(path, text, offset, maxChars, workspaceReadOutputLimit(), format)
-        listOf(UIMessagePart.Text(page))
+        listOf(UIMessagePart.Text(page.json))
     },
 )
 
@@ -189,14 +222,14 @@ private suspend fun readParsedDocument(
     val limitMessage = "Document is too large to read: $path (max ${MAX_DOCUMENT_BYTES / 1024 / 1024}MB)"
     repository.resolveAbsoluteFile(workspaceId, path)?.let { file ->
         require(file.length() <= MAX_DOCUMENT_BYTES) { limitMessage }
-        return@withContext parse(file)
+        return@withContext withContext(documentParserDispatcher) { parse(file) }
     }
 
     tempDir.mkdirs()
     val temp = File.createTempFile("rikkahub-doc-", ".$extension", tempDir)
     try {
         temp.outputStream().use { repository.exportBoundedRead(workspaceId, path, it, MAX_DOCUMENT_BYTES, limitMessage) }
-        parse(temp)
+        withContext(documentParserDispatcher) { parse(temp) }
     } finally {
         temp.delete()
     }

@@ -179,13 +179,14 @@ internal fun createSubagentTool(
     assistant: Assistant,
     model: Model,
     conversationId: Uuid,
-    tools: List<Tool>,
+    buildTools: () -> List<Tool>,
     providerManager: ProviderManager,
     usageRecorder: UsageRecorder,
     manager: SubagentManager,
 ): Tool {
-    val readOnlyTools = subagentTools(tools)
-    val sideEffectTools = subagentTools(tools, allowSideEffects = true)
+    val tools by lazy(buildTools)
+    val readOnlyTools by lazy { subagentTools(tools) }
+    val sideEffectTools by lazy { subagentTools(tools, allowSideEffects = true) }
     return Tool(
         name = SUBAGENT_TOOL_NAME,
         description = """

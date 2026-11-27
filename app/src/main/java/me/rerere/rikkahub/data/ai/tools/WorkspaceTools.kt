@@ -126,23 +126,30 @@ private class ReadFileCache {
 
     private val entry = AtomicReference<Entry?>(null)
 
-    suspend fun load(
+    suspend fun readPage(
         repository: WorkspaceRepository,
         workspaceId: String,
         path: String,
         offset: Int,
-    ): String = withContext(Dispatchers.IO) {
+        maxChars: Int,
+    ): WorkspaceTextPage = withContext(Dispatchers.IO) {
+        val budget = workspaceReadOutputLimit()
         val before = repository.readFileStamp(workspaceId, path)
         val cached = entry.get()
         if (cached != null && cached.path == path) {
-            if (offset > 0 && before == cached.stamp) return@withContext cached.text
+            if (offset > 0 && before == cached.stamp) {
+                val page = workspaceTextPage(path, cached.text, offset, maxChars, budget)
+                if (!page.hasMore) entry.compareAndSet(cached, null)
+                return@withContext page
+            }
             entry.compareAndSet(cached, null)
         }
         val text = repository.readTextInRootfs(workspaceId, path)
-        if (before != null && before == repository.readFileStamp(workspaceId, path)) {
+        val page = workspaceTextPage(path, text, offset, maxChars, budget)
+        if (page.hasMore && before != null && before == repository.readFileStamp(workspaceId, path)) {
             entry.set(Entry(path, before, text))
         }
-        text
+        page
     }
 }
 
@@ -208,9 +215,8 @@ private fun createReadFileTool(
                 val offset = params.workspaceReadOffset()
                 val maxChars = (params.string("max_chars")?.toIntOrNull() ?: DEFAULT_FILE_READ_CHARS)
                     .coerceIn(1, DEFAULT_FILE_READ_CHARS)
-                val text = readFileCache.load(workspaceRepository, workspaceId, path, offset)
-                val page = workspaceTextPage(path, text, offset, maxChars, workspaceReadOutputLimit())
-                listOf(UIMessagePart.Text(page))
+                val page = readFileCache.readPage(workspaceRepository, workspaceId, path, offset, maxChars)
+                listOf(UIMessagePart.Text(page.json))
             }
         },
     )
@@ -560,12 +566,15 @@ private suspend fun WorkspaceRepository.readImageInRootfs(
     workspaceId: String,
     path: String,
 ): List<UIMessagePart> {
-    val bytes = readRootfsBuffer(workspaceId, path).toByteArray()
-
     val filesManager = getKoin().get<FilesManager>()
-    val uris = filesManager.createChatFilesByByteArrays(listOf(bytes))
+    val uri = filesManager.createChatImage { output ->
+        exportBoundedRead(
+            workspaceId, path, output, MAX_READ_FILE_BYTES,
+            "File is too large to read: $path (max ${MAX_READ_FILE_BYTES / 1024 / 1024}MB).",
+        )
+    }
     return listOf(
-        UIMessagePart.Image(url = uris.first().toString()),
+        UIMessagePart.Image(url = uri.toString()),
         UIMessagePart.Text(
             buildJsonObject {
                 put("path", path)

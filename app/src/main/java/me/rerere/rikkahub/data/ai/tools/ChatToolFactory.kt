@@ -79,16 +79,31 @@ private val CONCURRENCY_SAFE_TOOL_NAMES = setOf(
  *
  * 只保留开头会丢掉命令末尾的错误和最终结果; 头尾各留一半, 中间用省略标记代替。
  */
-internal fun toolOutputPreview(text: String, maxChars: Int): String {
+internal fun toolOutputPreview(texts: List<String>, maxChars: Int): String {
     require(maxChars > 0) { "maxChars must be positive" }
-    if (text.length <= maxChars) return text
+    val length = texts.sumOf { it.length.toLong() } + (texts.size - 1).coerceAtLeast(0)
+    if (length <= maxChars) return texts.joinToString("\n")
     val head = maxChars / 2
     val tail = maxChars - head
     return buildString {
-        append(text.take(head))
+        appendToolOutputRange(texts, 0L, head.toLong())
         appendLine()
-        appendLine("... [${text.length - maxChars} characters omitted] ...")
-        append(text.takeLast(tail))
+        appendLine("... [${length - maxChars} characters omitted] ...")
+        appendToolOutputRange(texts, length - tail, length)
+    }
+}
+
+/** Append a range of the newline-joined output without materializing the skipped text. */
+private fun StringBuilder.appendToolOutputRange(texts: List<String>, start: Long, end: Long) {
+    var offset = 0L
+    for ((index, text) in texts.withIndex()) {
+        if (offset >= end) break
+        val textEnd = offset + text.length
+        if (textEnd > start) {
+            append(text, (start - offset).coerceAtLeast(0).toInt(), (end - offset).coerceAtMost(text.length.toLong()).toInt())
+        }
+        if (index < texts.lastIndex && textEnd in start until end) append('\n')
+        offset = textEnd + 1
     }
 }
 
@@ -184,7 +199,7 @@ class ChatToolFactory(
                     assistant = assistant,
                     model = model,
                     conversationId = conversationId,
-                    tools = baseTools.map { withSubagentOutputCap(it) },
+                    buildTools = { baseTools.map { withSubagentOutputCap(it) } },
                     providerManager = providerManager,
                     usageRecorder = usageRecorder,
                     manager = subagentManager,
@@ -203,7 +218,7 @@ class ChatToolFactory(
     }
 
     private fun withOutputTruncation(tool: Tool, includeHostPath: Boolean): Tool {
-        if (tool.name in TOOLS_WITHOUT_OUTPUT_TRUNCATION) return tool
+        if (tool.name in TOOLS_WITHOUT_OUTPUT_TRUNCATION || tool.name in WORKSPACE_PAGED_READ_TOOLS) return tool
         val execute = tool.execute
         return tool.copy(execute = { truncateOutput(execute(it), includeHostPath) })
     }
@@ -217,18 +232,16 @@ class ChatToolFactory(
     private fun withSubagentOutputCap(tool: Tool): Tool {
         if (tool.name in TOOLS_WITHOUT_OUTPUT_TRUNCATION) return tool
         val execute = tool.execute
+        if (tool.name in WORKSPACE_PAGED_READ_TOOLS) {
+            return tool.copy(execute = { args -> withContext(SubagentWorkspaceRead) { execute(args) } })
+        }
         return tool.copy(execute = { args ->
-            val output = if (tool.name in WORKSPACE_PAGED_READ_TOOLS) {
-                withContext(SubagentWorkspaceRead) { execute(args) }
-            } else {
-                execute(args)
-            }
-            val textParts = output.filterIsInstance<UIMessagePart.Text>()
-            val totalChars = textParts.sumOf { it.text.length }
+            val output = execute(args)
+            val totalChars = output.sumOf { (it as? UIMessagePart.Text)?.text?.length?.toLong() ?: 0L }
             if (totalChars <= SUBAGENT_MAX_TOOL_OUTPUT_CHARS) {
                 output
             } else {
-                val fullText = textParts.joinToString("\n") { it.text }
+                val texts = output.mapNotNull { (it as? UIMessagePart.Text)?.text }
                 listOf(
                     UIMessagePart.Text(
                         buildString {
@@ -238,7 +251,7 @@ class ChatToolFactory(
                                     "Narrow the request if you need more."
                             )
                             appendLine()
-                            append(toolOutputPreview(fullText, SUBAGENT_TOOL_OUTPUT_PREVIEW_CHARS))
+                            append(toolOutputPreview(texts, SUBAGENT_TOOL_OUTPUT_PREVIEW_CHARS))
                         }
                     )
                 ) + output.filter { it !is UIMessagePart.Text }
@@ -247,15 +260,32 @@ class ChatToolFactory(
     }
 
     private fun truncateOutput(output: List<UIMessagePart>, includeHostPath: Boolean): List<UIMessagePart> {
-        val textParts = output.filterIsInstance<UIMessagePart.Text>()
-        val totalChars = textParts.sumOf { it.text.length }
+        val totalChars = output.sumOf { (it as? UIMessagePart.Text)?.text?.length?.toLong() ?: 0L }
         if (totalChars <= MAX_TOOL_OUTPUT_CHARS) return output
 
         val fileName = "${Uuid.random()}.txt"
         Log.i(TAG, "truncateOutput: saving $totalChars chars to $fileName")
-        val fullText = textParts.joinToString("\n") { it.text }
+        val texts = output.mapNotNull { (it as? UIMessagePart.Text)?.text }
         val outputDir = File(context.filesDir, FileFolders.TOOL_OUTPUTS).apply { mkdirs() }
-        File(outputDir, fileName).writeText(fullText)
+        val file = File(outputDir, fileName)
+        var written = false
+        try {
+            file.bufferedWriter().use { writer ->
+                texts.forEachIndexed { index, text ->
+                    if (index > 0) writer.write('\n'.code)
+                    // Writer.append can copy a whole String into a CharArray. Keep the buffer bounded.
+                    var start = 0
+                    while (start < text.length) {
+                        val length = minOf(DEFAULT_BUFFER_SIZE, text.length - start)
+                        writer.write(text, start, length)
+                        start += length
+                    }
+                }
+            }
+            written = true
+        } finally {
+            if (!written) file.delete()
+        }
 
         return listOf(
             UIMessagePart.Text(
@@ -276,7 +306,7 @@ class ChatToolFactory(
                     appendLine("Use shell to read: `cat '$shellPath'`")
                     appendLine("Use shell to search: `grep \"pattern\" '$shellPath'`")
                     appendLine()
-                    append(toolOutputPreview(fullText, TOOL_OUTPUT_PREVIEW_CHARS))
+                    append(toolOutputPreview(texts, TOOL_OUTPUT_PREVIEW_CHARS))
                 }
             )
         ) + output.filter { it !is UIMessagePart.Text }

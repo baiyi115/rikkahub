@@ -7,6 +7,7 @@ import android.util.Log
 import androidx.core.net.toFile
 import androidx.core.net.toUri
 import java.io.File
+import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlinx.coroutines.Dispatchers
@@ -142,6 +143,22 @@ class FilesManager(
             }
         }
         return newUris
+    }
+
+    internal suspend fun createChatImage(write: suspend (OutputStream) -> Unit): Uri = withContext(Dispatchers.IO) {
+        val displayName = "image.png"
+        val mimeType = "image/png"
+        val folder = FileFolders.UPLOAD
+        val file = createTargetFile(folder, displayName, mimeType)
+        var saved = false
+        try {
+            file.outputStream().buffered().use { write(it) }
+            trackManagedFile(folder, file, displayName, mimeType)
+            saved = true
+            file.toUri()
+        } finally {
+            if (!saved) file.delete()
+        }
     }
 
     fun createChatFilesByByteArrays(

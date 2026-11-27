@@ -12,24 +12,23 @@ import me.rerere.ai.ui.UIMessagePart
  *
  * 由调用方在组装请求时调用，不放进 agent 循环：压缩这类不经过 [runAgent] 的请求也要用，否则请求前缀不一致。
  */
-fun List<UIMessage>.expandNotices(): List<UIMessage> = flatMap { message ->
-    if (message.parts.none { it is UIMessagePart.Notice }) {
-        return@flatMap listOf(message)
-    }
-    buildList {
-        val buffer = mutableListOf<UIMessagePart>()
-        fun flush() {
-            if (buffer.isNotEmpty()) add(message.copy(parts = buffer.toList()))
-            buffer.clear()
-        }
-        message.parts.forEach { part ->
-            if (part is UIMessagePart.Notice) {
-                flush()
-                add(UIMessage.user(part.text).copy(createdAt = message.createdAt, isSynthetic = true))
-            } else {
-                buffer.add(part)
+fun List<UIMessage>.expandNotices(): List<UIMessage> {
+    val first = indexOfFirst { message -> message.parts.any { it is UIMessagePart.Notice } }
+    if (first < 0) return this
+    return buildList(size) {
+        addAll(this@expandNotices.subList(0, first))
+        for (index in first until this@expandNotices.size) {
+            val message = this@expandNotices[index]
+            var start = 0
+            message.parts.forEachIndexed { partIndex, part ->
+                if (part is UIMessagePart.Notice) {
+                    if (start < partIndex) add(message.copy(parts = message.parts.subList(start, partIndex)))
+                    add(UIMessage.user(part.text).copy(createdAt = message.createdAt, isSynthetic = true))
+                    start = partIndex + 1
+                }
             }
+            if (start == 0) add(message)
+            else if (start < message.parts.size) add(message.copy(parts = message.parts.subList(start, message.parts.size)))
         }
-        flush()
     }
 }
