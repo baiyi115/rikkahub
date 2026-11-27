@@ -28,6 +28,10 @@ import kotlin.uuid.Uuid
 private const val SHELL_TIMEOUT_MAX_SECONDS = 600L
 private const val MAX_READ_FILE_BYTES = 8L * 1024 * 1024
 
+// 单次读取返回的字符数, 留出 JSON 字段的余量, 整段结果仍在工具输出上限之内
+private const val DEFAULT_FILE_READ_CHARS = 30_000
+private const val MIN_FILE_READ_CHARS = 256
+
 val WorkspaceToolDefaultApprovals: Map<String, Boolean> = mapOf(
     "workspace_read_file" to false,
     "workspace_write_file" to false,
@@ -111,28 +115,50 @@ private fun createReadFileTool(
         Read a file using the assistant's bound workspace Rootfs. Paths must be absolute inside Rootfs.
         Use ${layout.workspaceDir} for the workspace files area.
         Supports UTF-8 text files and image files (png, jpg, jpeg, gif, webp, bmp, svg, heic, heif, avif, ico).
+        Long files are returned in slices: continue with offset while truncated is true.
         For PDF, DOCX, PPTX, XLSX and EPUB documents use workspace_read_document instead.
     """.trimIndent().replace("\n", " "),
     parameters = {
         InputSchema.Obj(
             properties = buildJsonObject {
                 putPathProperty(layout, required = true)
+                put("offset", buildJsonObject {
+                    put("type", "integer")
+                    put("description", "Start character offset in the file. Defaults to 0.")
+                })
+                put("max_chars", buildJsonObject {
+                    put("type", "integer")
+                    put(
+                        "description",
+                        "Characters to return. Default and maximum $DEFAULT_FILE_READ_CHARS."
+                    )
+                })
             },
             required = listOf("path"),
         )
     },
     needsApproval = { needsApproval("workspace_read_file") },
     execute = {
-        val path = it.jsonObject.absolutePath("path")
+        val params = it.jsonObject
+        val path = params.absolutePath("path")
         if (path.isImagePath()) {
             workspaceRepository.readImageInRootfs(workspaceId, path)
         } else {
             val text = workspaceRepository.readTextInRootfs(workspaceId, path)
+            val offset = (params.string("offset")?.toIntOrNull() ?: 0).coerceAtLeast(0)
+            val maxChars = (params.string("max_chars")?.toIntOrNull() ?: DEFAULT_FILE_READ_CHARS)
+                .coerceIn(MIN_FILE_READ_CHARS, DEFAULT_FILE_READ_CHARS)
+            val start = offset.coerceIn(0, text.length)
+            val slice = documentSlice(text, start, maxChars)
             listOf(
                 UIMessagePart.Text(
                     buildJsonObject {
                         put("path", path)
-                        put("text", text)
+                        put("offset", start)
+                        put("total_chars", text.length)
+                        put("returned_chars", slice.length)
+                        put("truncated", start + slice.length < text.length)
+                        put("text", slice)
                     }.toString()
                 )
             )

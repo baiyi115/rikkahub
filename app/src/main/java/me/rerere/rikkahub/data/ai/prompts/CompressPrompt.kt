@@ -37,6 +37,9 @@ internal fun buildCompressPrompt(
         ## Open Items
         Unfinished tasks, open questions, and anything the user is waiting for.
 
+        ## Plan
+        The task list from the conversation, if there is one: every item in order with its status (pending, in progress, completed), keeping the wording of each item.
+
         ## Current State
         What was being worked on right before this summary, and the next step if one is clear.
 
