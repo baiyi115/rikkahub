@@ -27,18 +27,18 @@ internal fun createSubagentControlTools(
     manager: SubagentManager,
     conversationId: Uuid,
 ): List<Tool> = listOf(
-    createSubagentSendTool(manager),
-    createSubagentWaitTool(manager),
+    createSubagentSendTool(manager, conversationId),
+    createSubagentWaitTool(manager, conversationId),
     createSubagentListTool(manager, conversationId),
-    createSubagentCloseTool(manager),
+    createSubagentCloseTool(manager, conversationId),
 )
 
-private fun createSubagentSendTool(manager: SubagentManager) = Tool(
+private fun createSubagentSendTool(manager: SubagentManager, conversationId: Uuid) = Tool(
     name = SUBAGENT_SEND_TOOL_NAME,
     description = """
         Send a message to a subagent you started with background=true.
-        While it is running the message is delivered before its next model step, so use it to correct course,
-        narrow the scope, or add information you learned meanwhile. If it has already finished, the message starts
+        While it is running the message is queued for its next model step. If it finishes before that step,
+        the queued message starts a follow-up turn. If it has already finished, the message starts
         a new turn on the same context, so it keeps everything it read before instead of starting over.
         Finish by collecting the result with subagent_wait.
     """.trimIndent().replace("\n", " "),
@@ -63,21 +63,22 @@ private fun createSubagentSendTool(manager: SubagentManager) = Tool(
         val message = params.string("message")?.trim().orEmpty()
         require(agentId.isNotEmpty()) { "agent_id is required" }
         require(message.isNotEmpty()) { "message is required" }
-        val payload = when (manager.send(agentId, message)) {
+        require(message.length <= 16_000) { "message must be at most 16000 characters" }
+        val payload = when (manager.send(conversationId, agentId, message)) {
             SendOutcome.NotFound -> buildJsonObject {
                 put("ok", false)
                 put("error", "No subagent with id \"$agentId\". Use subagent_list to see the live agents.")
             }
 
-            SendOutcome.Closed -> buildJsonObject {
+            SendOutcome.MailboxFull -> buildJsonObject {
                 put("ok", false)
-                put("error", "Subagent \"$agentId\" is closed and cannot receive messages.")
+                put("error", "The subagent's message queue is full.")
             }
 
-            SendOutcome.Delivered -> buildJsonObject {
+            SendOutcome.Queued -> buildJsonObject {
                 put("ok", true)
-                put("status", "delivered")
-                put("note", "The subagent sees this before its next step.")
+                put("status", "queued")
+                put("note", "Queued for the next model step or a follow-up turn if it finishes first.")
             }
 
             SendOutcome.Started -> buildJsonObject {
@@ -90,7 +91,7 @@ private fun createSubagentSendTool(manager: SubagentManager) = Tool(
     },
 )
 
-private fun createSubagentWaitTool(manager: SubagentManager) = Tool(
+private fun createSubagentWaitTool(manager: SubagentManager, conversationId: Uuid) = Tool(
     name = SUBAGENT_WAIT_TOOL_NAME,
     description = """
         Wait for a background subagent to finish its current turn, then return its status and report.
@@ -121,29 +122,20 @@ private fun createSubagentWaitTool(manager: SubagentManager) = Tool(
         require(agentId.isNotEmpty()) { "agent_id is required" }
         val timeoutSeconds = (params.string("timeout_seconds")?.toLongOrNull() ?: DEFAULT_WAIT_SECONDS)
             .coerceIn(1L, MAX_WAIT_SECONDS)
-        val payload = when (val outcome = manager.waitFor(agentId, timeoutSeconds * 1_000L)) {
-            WaitOutcome.NotFound -> error(
-                "No subagent with id \"$agentId\". Use subagent_list to see the live agents."
-            )
-
-            is WaitOutcome.Done -> buildJsonObject {
-                put("agent_id", agentId)
-                put("status", outcome.status)
-                put("outcome", outcome.outcome)
-                put("timed_out", outcome.timedOut)
-                put(
-                    "result",
-                    outcome.report.ifBlank {
-                        if (outcome.status == SubagentStatus.RUNNING.wire) {
-                            "The subagent is still running and has not produced a report yet."
-                        } else {
-                            "(the subagent produced no text output)"
-                        }
-                    }
-                )
-                if (outcome.steps > 0) put("steps", outcome.steps)
-                if (outcome.tokens > 0) put("tokens", outcome.tokens)
-            }
+        val outcome = manager.waitFor(conversationId, agentId, timeoutSeconds * 1_000L)
+            ?: error("No subagent with id \"$agentId\". Use subagent_list to see the live agents.")
+        val agent = outcome.agent
+        val payload = buildJsonObject {
+            put("agent_id", agentId)
+            put("status", agent.status.wire)
+            put("outcome", agent.outcome)
+            put("timed_out", outcome.timedOut)
+            put("result", agent.report.ifBlank {
+                if (agent.status == SubagentStatus.RUNNING) "The subagent is still running."
+                else "(the subagent produced no text output)"
+            })
+            if (agent.steps > 0) put("steps", agent.steps)
+            if (agent.tokens > 0) put("tokens", agent.tokens)
         }
         listOf(UIMessagePart.Text(payload.toString()))
     },
@@ -159,7 +151,7 @@ private fun createSubagentListTool(manager: SubagentManager, conversationId: Uui
         InputSchema.Obj(properties = buildJsonObject {})
     },
     execute = {
-        val agents = manager.list(conversationId).filter { it.status != SubagentStatus.CLOSED }
+        val agents = manager.list(conversationId)
         val payload = buildJsonObject {
             put("count", agents.size)
             put(
@@ -183,7 +175,7 @@ private fun createSubagentListTool(manager: SubagentManager, conversationId: Uui
     },
 )
 
-private fun createSubagentCloseTool(manager: SubagentManager) = Tool(
+private fun createSubagentCloseTool(manager: SubagentManager, conversationId: Uuid) = Tool(
     name = SUBAGENT_CLOSE_TOOL_NAME,
     description = """
         Stop a subagent when its result is no longer needed and free its slot. A closed subagent cannot be
@@ -203,7 +195,7 @@ private fun createSubagentCloseTool(manager: SubagentManager) = Tool(
     execute = { args ->
         val agentId = args.jsonObject.string("agent_id")?.trim().orEmpty()
         require(agentId.isNotEmpty()) { "agent_id is required" }
-        val previous = manager.close(agentId)
+        val previous = manager.close(conversationId, agentId)
             ?: error("No subagent with id \"$agentId\". Use subagent_list to see the live agents.")
         val payload = buildJsonObject {
             put("ok", true)

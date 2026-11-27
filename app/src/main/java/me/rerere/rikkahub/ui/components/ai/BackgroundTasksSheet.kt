@@ -44,17 +44,23 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import me.rerere.hugeicons.HugeIcons
+import me.rerere.hugeicons.stroke.AiBrain01
 import me.rerere.hugeicons.stroke.Alert01
 import me.rerere.hugeicons.stroke.ArrowLeft01
 import me.rerere.hugeicons.stroke.Cancel01
+import me.rerere.hugeicons.stroke.CheckList
 import me.rerere.hugeicons.stroke.ComputerTerminal01
 import me.rerere.hugeicons.stroke.StopCircle
 import me.rerere.hugeicons.stroke.Tick01
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.ai.tools.SubagentSnapshot
+import me.rerere.rikkahub.data.ai.tools.SubagentStatus
 import me.rerere.rikkahub.service.BackgroundShellLogTail
 import me.rerere.rikkahub.service.BackgroundShellManager
 import me.rerere.rikkahub.service.BackgroundShellStatus
 import me.rerere.rikkahub.service.BackgroundShellTask
+import me.rerere.rikkahub.ui.components.message.tools.TodoToolUI
+import me.rerere.rikkahub.ui.components.message.tools.ToolUIContext
 import me.rerere.rikkahub.ui.components.richtext.HighlightCodeBlock
 import me.rerere.rikkahub.ui.components.ui.CardGroup
 import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
@@ -67,17 +73,23 @@ private const val LOG_POLL_INTERVAL_MS = 1_000L
 
 /** 会话的后台命令：列表里看状态、终止，点进去看日志 */
 @Composable
-fun BackgroundTasksSheet(
+internal fun BackgroundTasksSheet(
     tasks: List<BackgroundShellTask>,
+    subagents: List<SubagentSnapshot>,
+    plan: ToolUIContext?,
     onStop: suspend (String) -> Unit,
+    onCloseSubagent: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     var selectedId by remember { mutableStateOf<String?>(null) }
+    var showPlan by remember { mutableStateOf(false) }
     // 终止要等宽限期，等待期间按钮显示进行中
     var stopping by remember { mutableStateOf(emptySet<String>()) }
-    val now by produceState(System.currentTimeMillis()) {
-        while (true) {
+    val runningShell = tasks.any { it.status == BackgroundShellStatus.RUNNING }
+    val now by produceState(System.currentTimeMillis(), runningShell) {
+        value = System.currentTimeMillis()
+        while (runningShell) {
             delay(1_000)
             value = System.currentTimeMillis()
         }
@@ -85,11 +97,15 @@ fun BackgroundTasksSheet(
     val stop: (String) -> Unit = { id ->
         stopping = stopping + id
         scope.launch {
-            onStop(id)
-            stopping = stopping - id
+            try {
+                onStop(id)
+            } finally {
+                stopping = stopping - id
+            }
         }
     }
     val selected = tasks.find { it.id == selectedId }
+    val selectedAgent = subagents.find { it.id == selectedId }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -103,7 +119,13 @@ fun BackgroundTasksSheet(
                 .padding(bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            if (selected != null) {
+            if (showPlan && plan != null) {
+                BackHandler { showPlan = false }
+                IconButton(onClick = { showPlan = false }) {
+                    Icon(HugeIcons.ArrowLeft01, contentDescription = stringResource(R.string.back))
+                }
+                TodoToolUI.Preview(plan) { showPlan = false }
+            } else if (selected != null) {
                 BackHandler { selectedId = null }
                 TaskDetail(
                     task = selected,
@@ -112,13 +134,27 @@ fun BackgroundTasksSheet(
                     onBack = { selectedId = null },
                     onStop = { stop(selected.id) },
                 )
+            } else if (selectedAgent != null) {
+                BackHandler { selectedId = null }
+                SubagentDetail(
+                    agent = selectedAgent,
+                    onBack = { selectedId = null },
+                    onClose = {
+                        selectedId = null
+                        onCloseSubagent(selectedAgent.id)
+                    },
+                )
             } else {
                 TaskList(
                     tasks = tasks,
+                    subagents = subagents,
+                    plan = plan,
+                    onShowPlan = { showPlan = true },
                     now = now,
                     stopping = stopping,
                     onSelect = { selectedId = it },
                     onStop = stop,
+                    onCloseSubagent = onCloseSubagent,
                 )
             }
         }
@@ -128,13 +164,17 @@ fun BackgroundTasksSheet(
 @Composable
 private fun TaskList(
     tasks: List<BackgroundShellTask>,
+    subagents: List<SubagentSnapshot>,
+    plan: ToolUIContext?,
+    onShowPlan: () -> Unit,
+    onCloseSubagent: (String) -> Unit,
     now: Long,
     stopping: Set<String>,
     onSelect: (String) -> Unit,
     onStop: (String) -> Unit,
 ) {
     Text(text = stringResource(R.string.background_tasks_title), style = MaterialTheme.typography.titleMedium)
-    if (tasks.isEmpty()) {
+    if (tasks.isEmpty() && subagents.isEmpty() && plan == null) {
         Text(
             text = stringResource(R.string.background_tasks_empty),
             style = MaterialTheme.typography.bodyMedium,
@@ -148,6 +188,27 @@ private fun TaskList(
             .verticalScroll(rememberScrollState()),
     ) {
         CardGroup {
+            if (plan != null) {
+                item(
+                    onClick = onShowPlan,
+                    leadingContent = { CardGroupIcon(icon = HugeIcons.CheckList) },
+                    headlineContent = { Text(TodoToolUI.title(plan)) },
+                    supportingContent = { TodoToolUI.Summary(plan) },
+                )
+            }
+            subagents.asReversed().forEach { agent ->
+                item(
+                    onClick = { onSelect(agent.id) },
+                    leadingContent = { CardGroupIcon(icon = HugeIcons.AiBrain01) },
+                    headlineContent = { Text(agent.description, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    supportingContent = { Text(agent.statusText()) },
+                    trailingContent = if (agent.status == SubagentStatus.RUNNING) {
+                        { StopButton(stopping = false, onClick = { onCloseSubagent(agent.id) }) }
+                    } else {
+                        null
+                    },
+                )
+            }
             // 最新启动的排在最前
             tasks.asReversed().forEach { task ->
                 item(
@@ -170,6 +231,48 @@ private fun TaskList(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun SubagentSnapshot.statusText(): String = stringResource(
+    when (outcome) {
+        "running" -> R.string.tool_ui_subagent_running
+        "completed" -> R.string.tool_ui_subagent_status_completed
+        "timeout" -> R.string.tool_ui_subagent_status_timeout
+        "step_limit_reached" -> R.string.tool_ui_subagent_status_step_limit
+        "token_limit_reached" -> R.string.tool_ui_subagent_status_token_limit
+        else -> R.string.tool_ui_subagent_status_failed
+    }
+)
+
+@Composable
+private fun ColumnScope.SubagentDetail(
+    agent: SubagentSnapshot,
+    onBack: () -> Unit,
+    onClose: () -> Unit,
+) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        IconButton(onClick = onBack) {
+            Icon(HugeIcons.ArrowLeft01, contentDescription = stringResource(R.string.back))
+        }
+        Column(Modifier.weight(1f)) {
+            Text(agent.description, style = MaterialTheme.typography.titleMedium, maxLines = 2)
+            Text(agent.statusText(), style = MaterialTheme.typography.bodySmall)
+        }
+        FilledTonalButton(onClick = onClose) {
+            val label = if (agent.status == SubagentStatus.RUNNING) R.string.stop else R.string.tool_ui_subagent_close
+            Text(stringResource(label))
+        }
+    }
+    if (agent.steps > 0 || agent.tokens > 0) {
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (agent.steps > 0) Text(stringResource(R.string.tool_ui_subagent_steps, agent.steps))
+            if (agent.tokens > 0) Text(stringResource(R.string.tool_ui_subagent_tokens, agent.tokens))
+        }
+    }
+    SelectionContainer(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState())) {
+        Text(agent.report.ifBlank { stringResource(R.string.tool_ui_subagent_empty) })
     }
 }
 

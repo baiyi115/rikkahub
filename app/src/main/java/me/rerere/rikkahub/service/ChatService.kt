@@ -50,7 +50,6 @@ import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.ai.prompts.buildCompressPrompt
 import me.rerere.rikkahub.data.ai.tools.InvalidMcpServerNamesException
 import me.rerere.rikkahub.data.ai.tools.SubagentManager
-import me.rerere.rikkahub.data.ai.tools.SubagentNoticeEvent
 import me.rerere.rikkahub.data.ai.tools.local.LocalTools
 import me.rerere.rikkahub.data.ai.tools.shouldUseExternalWebSearch
 import me.rerere.rikkahub.data.datastore.SettingsStore
@@ -237,9 +236,7 @@ class ChatService(
         // 后台子代理跑完时把结果投进收件箱: 主代理还在这一轮里就在下一步看到, 已经结束就开新一轮
         appScope.launch {
             subagentManager.noticeEvents.collect { event ->
-                when (event) {
-                    is SubagentNoticeEvent.Posted -> postNotice(event.conversationId, event.key, event.notice)
-                }
+                postNotice(event.conversationId, event.key, event.notice)
             }
         }
     }
@@ -1564,17 +1561,21 @@ class ChatService(
 
     // 停止当前会话生成任务（不清理会话缓存）
     suspend fun stopGeneration(conversationId: Uuid) {
-        val session = sessionManager.get(conversationId) ?: return
-        val jobs = synchronized(session) {
+        val session = sessionManager.get(conversationId)
+        val jobs = if (session == null) emptyList() else synchronized(session) {
             session.inbox.pause()
             session.cancelJobs()
         }
+        subagentManager.stopRunning(conversationId)
         if (jobs.isEmpty()) return
         jobs.forEach { it.join() }
-        if (session.isInitialized) finishInterruptedPendingTools(session)
+        // A tool might have admitted a child while its parent was being cancelled.
+        subagentManager.stopRunning(conversationId)
+        if (session?.isInitialized == true) finishInterruptedPendingTools(session)
     }
 }
 
-// 一批工具按顺序执行，最后一个有了结果就是都执行完了；模型开始回复后末尾是新内容，不再成立
+// 并发批次可能先完成最后一个工具，只有整批产出结果时才保存检查点。
 private fun UIMessage.endsWithExecutedTool(): Boolean =
-    (parts.lastOrNull() as? UIMessagePart.Tool)?.isExecuted == true
+    (parts.lastOrNull() as? UIMessagePart.Tool)?.isExecuted == true &&
+        parts.none { it is UIMessagePart.Tool && !it.isExecuted }

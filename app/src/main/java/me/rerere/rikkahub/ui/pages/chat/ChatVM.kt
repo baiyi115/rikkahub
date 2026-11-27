@@ -24,12 +24,15 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import me.rerere.ai.core.MessageRole
 import me.rerere.ai.provider.Model
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.isEmptyInputMessage
 import me.rerere.rikkahub.BuildConfig
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.ai.tools.SubagentManager
+import me.rerere.rikkahub.data.ai.tools.TODO_TOOL_NAME
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.files.FilesManager
@@ -46,8 +49,10 @@ import me.rerere.rikkahub.service.BackgroundShellTask
 import me.rerere.rikkahub.service.ChatError
 import me.rerere.rikkahub.service.ChatService
 import me.rerere.rikkahub.service.SessionActivity
+import me.rerere.rikkahub.ui.components.message.tools.ToolUIContext
 import me.rerere.rikkahub.ui.hooks.writeStringPreference
 import me.rerere.rikkahub.ui.hooks.ChatInputState
+import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.rikkahub.utils.UiState
 import me.rerere.rikkahub.utils.UpdateChecker
 import me.rerere.rikkahub.web.ApiException
@@ -66,6 +71,7 @@ class ChatVM(
     private val filesManager: FilesManager,
     private val favoriteRepository: FavoriteRepository,
     private val backgroundShellManager: BackgroundShellManager,
+    private val subagentManager: SubagentManager,
 ) : ViewModel() {
     private val _conversationId: Uuid = Uuid.parse(id)
     val conversation: StateFlow<Conversation> = chatService.getConversationFlow(_conversationId)
@@ -161,6 +167,32 @@ class ChatVM(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     suspend fun stopBackgroundTask(id: String) = backgroundShellManager.stop(id)
+
+    internal val subagents = subagentManager.tasks
+        .map { it[_conversationId].orEmpty() }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), subagentManager.list(_conversationId))
+
+    // Keep the latest successful plan for the selected reply, including through tool updates.
+    internal val activePlan = conversation.map { chat ->
+        chat.messageNodes.asReversed().asSequence()
+            .map { it.currentMessage }
+            .takeWhile { it.role != MessageRole.USER || it.isNoticeOnly }
+            .flatMap { it.parts.asReversed().asSequence() }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .filter { it.toolName == TODO_TOOL_NAME && it.isExecuted }
+            .toList()
+    }.distinctUntilChanged().map { updates ->
+        updates.firstNotNullOfOrNull { tool ->
+            val output = tool.output.singleOrNull() as? UIMessagePart.Text ?: return@firstNotNullOfOrNull null
+            val content = runCatching { JsonInstant.parseToJsonElement(output.text) }.getOrNull()
+            ToolUIContext(tool, tool.inputAsJson(), content, loading = false)
+                .takeIf { it.todoItems != null }
+        }?.takeIf { !it.todoItems.isNullOrEmpty() }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    internal fun closeSubagent(id: String) {
+        subagentManager.close(_conversationId, id)
+    }
 
     // 生成完成
     val generationDoneFlow: SharedFlow<Uuid> = chatService.generationDoneFlow

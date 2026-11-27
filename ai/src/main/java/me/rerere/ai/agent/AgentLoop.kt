@@ -1,14 +1,10 @@
 package me.rerere.ai.agent
 
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.FlowCollector
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.launch
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
 import kotlinx.serialization.json.buildJsonObject
@@ -224,25 +220,38 @@ internal class AgentLoop(
         }
     }
 
-    private suspend fun executeConcurrently(tools: List<UIMessagePart.Tool>) {
-        val startedAt = Clock.System.now()
-        tools.forEach { tool ->
-            updateTool(tool.toolCallId) { it.copy(startedAt = startedAt, finishedAt = null) }
-        }
-        // 完成顺序不固定，用锁把消息更新串起来；每个结果仍然写回自己的 toolCallId
-        val updateMutex = Mutex()
-        val permits = Semaphore(MAX_CONCURRENT_TOOLS.coerceAtMost(tools.size))
-        coroutineScope {
-            tools.map { tool ->
-                async {
-                    val output = permits.withPermit { execute(tool) }
-                    updateMutex.withLock {
-                        updateTool(tool.toolCallId) {
-                            it.copy(output = output, finishedAt = Clock.System.now())
-                        }
+    private data class ToolUpdate(
+        val id: String,
+        val at: kotlin.time.Instant,
+        val output: List<UIMessagePart>? = null,
+    )
+
+    private suspend fun executeConcurrently(tools: List<UIMessagePart.Tool>) = coroutineScope {
+        val updates = Channel<ToolUpdate>()
+        val next = java.util.concurrent.atomic.AtomicInteger()
+        repeat(minOf(MAX_CONCURRENT_TOOLS, tools.size)) {
+            launch {
+                try {
+                    while (true) {
+                        val tool = tools.getOrNull(next.getAndIncrement()) ?: break
+                        updates.send(ToolUpdate(tool.toolCallId, Clock.System.now()))
+                        val output = execute(tool)
+                        updates.send(ToolUpdate(tool.toolCallId, Clock.System.now(), output))
                     }
+                } catch (e: CancellationException) {
+                    // A cancelled child does not cancel its parent; wake a receiver waiting for its result.
+                    updates.cancel(e)
+                    throw e
                 }
-            }.awaitAll()
+            }
+        }
+        // 只有收集 Flow 的父协程写消息和发事件，子协程只计算工具结果。
+        repeat(tools.size * 2) {
+            val update = updates.receive()
+            updateTool(update.id) { tool ->
+                if (update.output == null) tool.copy(startedAt = update.at, finishedAt = null)
+                else tool.copy(output = update.output, finishedAt = update.at)
+            }
         }
     }
 

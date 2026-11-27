@@ -1255,7 +1255,7 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="tool_ui_subagent_tools">工具调用</string>
   <string name="tool_ui_subagent_tool_not_executed">未执行</string>
   <string name="tool_ui_subagent_empty">暂无报告</string>
-  <string name="tool_ui_subagent_background">后台运行中：%1$s</string>
+  <string name="tool_ui_subagent_background">已在后台启动：%1$s</string>
   <string name="tool_ui_subagent_send">给子代理发消息</string>
   <string name="tool_ui_subagent_list">子代理列表</string>
   <string name="tool_ui_subagent_close">关闭子代理</string>

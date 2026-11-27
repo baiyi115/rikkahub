@@ -82,6 +82,7 @@ import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.data.ai.tools.SubagentStatus
 import me.rerere.rikkahub.service.BackgroundShellStatus
 import me.rerere.rikkahub.service.ChatError
 import me.rerere.rikkahub.service.SessionActivity
@@ -386,10 +387,15 @@ private fun ChatPageContent(
                 val messageQueue by vm.messageQueue.collectAsStateWithLifecycle()
                 val voiceState by vm.voiceSession.state.collectAsStateWithLifecycle()
                 val backgroundTasks by vm.backgroundTasks.collectAsStateWithLifecycle()
+                val subagents by vm.subagents.collectAsStateWithLifecycle()
+                val plan by vm.activePlan.collectAsStateWithLifecycle()
                 var showBackgroundTasks by remember { mutableStateOf(false) }
                 if (showBackgroundTasks) {
                     BackgroundTasksSheet(
                         tasks = backgroundTasks,
+                        subagents = subagents,
+                        plan = plan,
+                        onCloseSubagent = vm::closeSubagent,
                         onStop = vm::stopBackgroundTask,
                         onDismiss = { showBackgroundTasks = false },
                     )
@@ -404,7 +410,9 @@ private fun ChatPageContent(
                     onBeginEditQueuedMessage = vm::beginEditQueuedMessage,
                     onFinishEditQueuedMessage = vm::finishEditQueuedMessage,
                     onResumeMessageQueue = vm::resumeMessageQueue,
-                    runningBackgroundTasks = backgroundTasks.count { it.status == BackgroundShellStatus.RUNNING },
+                    runningBackgroundTasks = backgroundTasks.count { it.status == BackgroundShellStatus.RUNNING } +
+                        subagents.count { it.status == SubagentStatus.RUNNING },
+                    hasBackgroundTasks = backgroundTasks.isNotEmpty() || subagents.isNotEmpty() || plan != null,
                     onShowBackgroundTasks = { showBackgroundTasks = true },
                     loading = loadingJob != null,
                     settings = setting,

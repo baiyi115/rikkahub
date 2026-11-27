@@ -91,7 +91,7 @@ import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Add01
 import me.rerere.hugeicons.stroke.ArrowUp02
 import me.rerere.hugeicons.stroke.Cancel01
-import me.rerere.hugeicons.stroke.ComputerTerminal01
+import me.rerere.hugeicons.stroke.CheckList
 import me.rerere.hugeicons.stroke.Fullscreen
 import me.rerere.hugeicons.stroke.Zap
 import me.rerere.rikkahub.R
@@ -143,6 +143,7 @@ fun ChatInput(
     onFinishEditQueuedMessage: (Uuid, List<UIMessagePart>?) -> Unit = { _, _ -> },
     onResumeMessageQueue: () -> Unit = {},
     runningBackgroundTasks: Int = 0,
+    hasBackgroundTasks: Boolean = false,
     onShowBackgroundTasks: () -> Unit = {},
     onStartVoiceMode: (() -> Unit)? = null,
     voiceState: VoiceSessionState = VoiceSessionState(),
@@ -316,7 +317,7 @@ fun ChatInput(
                                 }
                             }
 
-                            if (runningBackgroundTasks > 0) {
+                            if (hasBackgroundTasks || runningBackgroundTasks > 0) {
                                 BackgroundTasksButton(
                                     running = runningBackgroundTasks,
                                     onClick = onShowBackgroundTasks,
@@ -442,16 +443,22 @@ private fun BackgroundTasksButton(
     BadgedBox(
         modifier = Modifier.padding(horizontal = 5.dp),
         badge = {
-            Badge(
-                containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary,
-            ) { Text(running.toString()) }
+            if (running > 0) {
+                Badge(
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                ) { Text(running.toString()) }
+            }
         },
     ) {
         ActionIconButton(onClick = onClick) {
             Icon(
-                imageVector = HugeIcons.ComputerTerminal01,
-                contentDescription = stringResource(R.string.background_tasks_running, running),
+                imageVector = HugeIcons.CheckList,
+                contentDescription = if (running > 0) {
+                    stringResource(R.string.background_tasks_running, running)
+                } else {
+                    stringResource(R.string.background_tasks_title)
+                },
             )
         }
     }

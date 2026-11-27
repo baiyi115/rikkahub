@@ -33,6 +33,7 @@ import me.rerere.ai.ui.UIMessagePart
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Notification01
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.ai.tools.displayText
 
 /**
  * 空闲时单独开一轮的运行时通知。角色是 user 但不是用户说的话，
@@ -86,7 +87,7 @@ fun ChatMessageNotices(
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     notices.forEach { notice ->
                         Text(
-                            text = notice.text,
+                            text = notice.displayText(),
                             style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

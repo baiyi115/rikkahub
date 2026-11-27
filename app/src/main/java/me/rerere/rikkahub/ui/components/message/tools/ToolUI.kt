@@ -30,6 +30,8 @@ import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.ai.tools.SUBAGENT_CLOSE_TOOL_NAME
 import me.rerere.rikkahub.data.ai.tools.SUBAGENT_LIST_TOOL_NAME
 import me.rerere.rikkahub.data.ai.tools.SUBAGENT_SEND_TOOL_NAME
+import me.rerere.rikkahub.data.ai.tools.TodoItem
+import me.rerere.rikkahub.data.ai.tools.resolveTodoItems
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.ui.components.richtext.HighlightCodeBlock
 import me.rerere.rikkahub.ui.components.richtext.ZoomableAsyncImage
@@ -51,7 +53,13 @@ data class ToolUIContext(
     val loading: Boolean,
     /** 发起该工具调用的助手, 拿不到时为 null */
     val assistant: Assistant? = null,
-)
+) {
+    // 仅 todo_write 渲染器访问，标题、摘要和详情共用同一份清单。
+    internal val todoItems: List<TodoItem>? by lazy(LazyThreadSafetyMode.NONE) {
+        val result = tool.output.singleOrNull() as? UIMessagePart.Text
+        resolveTodoItems(arguments, content, result?.metadata)
+    }
+}
 
 /**
  * 单个工具的 UI 渲染器

@@ -98,6 +98,17 @@ private fun normalizeTodoItems(items: List<TodoItem>): Pair<List<TodoItem>, Bool
     return normalized to adjusted
 }
 
+internal fun resolveTodoItems(
+    arguments: JsonElement,
+    result: JsonElement?,
+    resultMetadata: JsonObject?,
+): List<TodoItem>? {
+    if (result?.jsonObjectOrNull?.get("ok") != JsonPrimitive(true)) return null
+    if (resultMetadata?.containsKey("items") == true) return parseTodoItems(resultMetadata)
+    // 旧结果只保存计数；用执行时相同的规则还原清单。
+    return parseTodoItems(arguments)?.let { normalizeTodoItems(it).first }
+}
+
 /**
  * 任务清单工具：模型用它写下多步计划，并在执行过程中更新。
  *
@@ -185,6 +196,18 @@ internal fun buildTodoTool(): Tool = Tool(
                 put("note", "Only one item can be in_progress; the others were changed to pending.")
             }
         }
-        listOf(UIMessagePart.Text(payload.toString()))
+        // 规范化后的清单随结果持久化，模型仍只收到简短的执行摘要。
+        val metadata = buildJsonObject {
+            put("items", buildJsonArray {
+                normalized.forEach { item ->
+                    add(buildJsonObject {
+                        put("content", item.content)
+                        put("status", item.status.name.lowercase())
+                        item.activeForm?.let { put("active_form", it) }
+                    })
+                }
+            })
+        }
+        listOf(UIMessagePart.Text(payload.toString(), metadata = metadata))
     },
 )

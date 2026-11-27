@@ -1,49 +1,42 @@
 package me.rerere.rikkahub.data.ai.tools
 
-import android.util.Log
-import kotlinx.coroutines.CancellationException
+import android.content.Context
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
-import me.rerere.ai.agent.AgentEvent
-import me.rerere.ai.agent.AgentFinishReason
-import me.rerere.ai.agent.AgentHooks
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import me.rerere.ai.agent.AgentRequest
 import me.rerere.ai.agent.RetryPolicy
-import me.rerere.ai.agent.StepRequest
-import me.rerere.ai.agent.runAgent
-import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.Tool
 import me.rerere.ai.provider.Provider
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
-import java.util.concurrent.ConcurrentHashMap
+import me.rerere.rikkahub.service.ChatGenerationForegroundService
+import me.rerere.rikkahub.service.SessionActivity
+import kotlin.time.TimeSource
 import kotlin.uuid.Uuid
 
-private const val TAG = "SubagentManager"
-
-/** 每个会话同时存活的后台子代理上限, 避免模型一次开出太多条独立请求 */
-internal const val SUBAGENT_MAX_LIVE = 4
-
-/** 完成通知里带多少字报告; 完整报告用 subagent_wait 取 */
+private const val MAX_LIVE_AGENTS = 4
+private const val MAX_PENDING_MESSAGES = 16
 private const val NOTICE_PREVIEW_CHARS = 400
+private const val SUBAGENT_REPORT_KEY = "subagent_report"
+
+internal fun UIMessagePart.Notice.displayText(): String =
+    (metadata?.get(SUBAGENT_REPORT_KEY) as? JsonPrimitive)?.contentOrNull ?: text
 
 internal enum class SubagentStatus(val wire: String) {
     RUNNING("running"),
@@ -51,49 +44,27 @@ internal enum class SubagentStatus(val wire: String) {
     CLOSED("closed"),
 }
 
-/** 后台子代理结束一轮时的通知, 由 ChatService 投进会话收件箱 */
-sealed interface SubagentNoticeEvent {
-    val conversationId: Uuid
-    val key: String
+internal data class SubagentSnapshot(
+    val id: String,
+    val description: String,
+    val status: SubagentStatus = SubagentStatus.RUNNING,
+    val outcome: String = "running",
+    val report: String = "",
+    val steps: Int = 0,
+    val tokens: Int = 0,
+)
 
-    data class Posted(
-        override val conversationId: Uuid,
-        override val key: String,
-        val notice: UIMessagePart.Notice,
-    ) : SubagentNoticeEvent
-}
+internal data class SubagentNoticeEvent(
+    val conversationId: Uuid,
+    val key: String,
+    val notice: UIMessagePart.Notice,
+)
 
-internal sealed interface SendOutcome {
-    data object NotFound : SendOutcome
-    data object Closed : SendOutcome
+internal enum class SendOutcome { NotFound, Queued, Started, MailboxFull }
 
-    /** 正在跑, 消息已放进邮箱, 下一步请求模型前送达 */
-    data object Delivered : SendOutcome
+internal data class WaitOutcome(val agent: SubagentSnapshot, val timedOut: Boolean = false)
 
-    /** 已经空闲, 带着原上下文开始新的一轮 */
-    data object Started : SendOutcome
-}
-
-internal sealed interface WaitOutcome {
-    data object NotFound : WaitOutcome
-
-    data class Done(
-        val status: String,
-        val outcome: String,
-        val report: String,
-        val steps: Int,
-        val tokens: Int,
-        val timedOut: Boolean,
-    ) : WaitOutcome
-}
-
-/**
- * 一个后台子代理的会话。
- *
- * 跑完一轮不销毁: 主代理可以继续用 [SubagentManager.send] 带着原上下文改方向,
- * 不必重新把已经读过的文件再读一遍。
- */
-internal class SubagentSession(
+internal data class SubagentSession(
     val id: String,
     val conversationId: Uuid,
     val description: String,
@@ -106,241 +77,247 @@ internal class SubagentSession(
     val maxSteps: Int,
     val timeoutSeconds: Long,
     val maxTotalTokens: Int,
-) {
-    val mutex = Mutex()
+)
 
-    /** 主代理在运行中发来的消息, 下一步请求模型前取走并追加到子代理的消息末尾 */
-    val mailbox = Channel<UIMessagePart.Notice>(Channel.UNLIMITED)
+class SubagentManager(private val context: Context? = null) {
+    private class Agent(val session: SubagentSession, task: String) {
+        var snapshot = SubagentSnapshot(session.id, session.description)
+        var history = listOf(UIMessage.system(session.systemPrompt), UIMessage.user(task))
+        val mailbox = ArrayDeque<String>()
+        var run: Run? = null
+    }
 
-    var messages: List<UIMessage> = emptyList()
+    private class Run {
+        val completion = CompletableDeferred<SubagentSnapshot>()
+        lateinit var job: Job
+        var steps = 0
+        var tokens = 0
+        var result: SubagentSnapshot? = null
+        val startedAt = TimeSource.Monotonic.markNow()
 
-    @Volatile
-    var status: SubagentStatus = SubagentStatus.RUNNING
+        fun remainingMillis(session: SubagentSession) =
+            session.timeoutSeconds * 1_000L - startedAt.elapsedNow().inWholeMilliseconds
+    }
 
-    var job: Job? = null
-
-    /** 当前这一轮的完成信号, 空闲时为 null */
-    var completion: CompletableDeferred<Unit>? = null
-
-    var report: String = ""
-    var outcome: String = "running"
-
-    /** 运行中由事件流更新, 等待方随时读取 */
-    @Volatile
-    var tokens: Int = 0
-    var steps: Int = 0
-    var startedAt: Long = System.currentTimeMillis()
-}
-
-/**
- * 后台子代理的注册表。
- *
- * 对应 Claude Code 的 agent 会话和 Codex 的 spawn_agent/send_input/wait_agent:
- * 子代理有自己的上下文和邮箱, 主代理可以继续干活、中途发消息改方向, 再等它给出报告。
- * 会话按 conversationId 归属, 进程重启后丢失; 完成时发通知, 主代理这一轮已经结束时
- * 由 ChatService 投进收件箱并开新一轮。
- */
-class SubagentManager {
-    private val sessions = ConcurrentHashMap<String, SubagentSession>()
+    // One lock protects ownership, admission, snapshots and turn transitions. No I/O under the lock.
+    private val lock = Any()
+    private val agents = mutableMapOf<Uuid, MutableMap<String, Agent>>()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val snapshots = MutableStateFlow<Map<Uuid, List<SubagentSnapshot>>>(emptyMap())
+    internal val tasks = snapshots.asStateFlow()
 
-    private val _noticeEvents = MutableSharedFlow<SubagentNoticeEvent>(extraBufferCapacity = 64)
-    val noticeEvents: SharedFlow<SubagentNoticeEvent> = _noticeEvents.asSharedFlow()
+    // A single ChatService consumer drains the queue, including completions before it starts collecting.
+    private val notices = Channel<SubagentNoticeEvent>(Channel.UNLIMITED)
+    internal val noticeEvents = notices.receiveAsFlow()
 
-    fun liveCount(conversationId: Uuid): Int = sessions.values.count {
-        it.conversationId == conversationId && it.status != SubagentStatus.CLOSED
+    internal fun list(conversationId: Uuid): List<SubagentSnapshot> = tasks.value[conversationId].orEmpty()
+
+    internal fun launch(session: SubagentSession, task: String) = synchronized(lock) {
+        val group = agents.getOrPut(session.conversationId) { linkedMapOf() }
+        check(group.size < MAX_LIVE_AGENTS) {
+            "Too many live subagents (${group.size}); close one with subagent_close first."
+        }
+        val agent = Agent(session, task)
+        group[session.id] = agent
+        startRun(agent)
+        publish(session.conversationId)
     }
 
-    internal fun list(conversationId: Uuid): List<SubagentSession> =
-        sessions.values
-            .filter { it.conversationId == conversationId }
-            .sortedBy { it.startedAt }
-
-    internal fun launch(session: SubagentSession, task: String) {
-        sessions[session.id] = session
-        session.messages = listOf(UIMessage.system(session.systemPrompt), UIMessage.user(task))
-        startRun(session)
+    internal fun send(conversationId: Uuid, id: String, text: String): SendOutcome = synchronized(lock) {
+        val agent = agents[conversationId]?.get(id) ?: return@synchronized SendOutcome.NotFound
+        if (agent.run != null) {
+            if (agent.mailbox.size >= MAX_PENDING_MESSAGES) return@synchronized SendOutcome.MailboxFull
+            agent.mailbox.addLast(text)
+            return@synchronized SendOutcome.Queued
+        }
+        agent.history = agent.history + UIMessage.user(text)
+        startRun(agent)
+        publish(conversationId)
+        SendOutcome.Started
     }
 
-    internal suspend fun send(id: String, text: String): SendOutcome {
-        val session = sessions[id] ?: return SendOutcome.NotFound
-        return session.mutex.withLock {
-            when (session.status) {
-                SubagentStatus.CLOSED -> SendOutcome.Closed
-                SubagentStatus.RUNNING -> {
-                    val sent = session.mailbox.trySend(
-                        UIMessagePart.Notice(title = "Message from the main agent", text = text)
-                    ).isSuccess
-                    if (sent) SendOutcome.Delivered else SendOutcome.NotFound
-                }
-
-                SubagentStatus.IDLE -> {
-                    // 带着之前的上下文继续: 已经读过的文件和搜索结果的工具结果都还在
-                    session.messages = session.messages + UIMessage.user(text)
-                    startRun(session)
-                    SendOutcome.Started
-                }
-            }
+    internal suspend fun waitFor(conversationId: Uuid, id: String, timeoutMillis: Long): WaitOutcome? {
+        val run = synchronized(lock) {
+            val agent = agents[conversationId]?.get(id) ?: return null
+            agent.run ?: return WaitOutcome(agent.snapshot)
+        }
+        val result = withTimeoutOrNull(timeoutMillis) { run.completion.await() }
+        if (result != null) return WaitOutcome(result)
+        return synchronized(lock) {
+            run.result?.let { return@synchronized WaitOutcome(it) }
+            val latest = agents[conversationId]?.get(id)?.snapshot ?: return@synchronized null
+            WaitOutcome(latest, timedOut = true)
         }
     }
 
-    /** 等当前这一轮结束; 已经空闲时立即返回 */
-    internal suspend fun waitFor(id: String, timeoutMillis: Long): WaitOutcome {
-        val session = sessions[id] ?: return WaitOutcome.NotFound
-        val completion = session.mutex.withLock { session.completion }
-        val timedOut = completion != null && withTimeoutOrNull(timeoutMillis) { completion.await() } == null
-        return session.mutex.withLock {
-            WaitOutcome.Done(
-                status = session.status.wire,
-                outcome = session.outcome,
-                report = session.report,
-                steps = session.steps,
-                tokens = session.tokens,
-                timedOut = timedOut,
-            )
+    internal fun close(conversationId: Uuid, id: String): String? = synchronized(lock) {
+        val agent = agents[conversationId]?.remove(id) ?: return@synchronized null
+        val status = agent.snapshot.status.wire
+        cancel(agent)
+        publish(conversationId)
+        status
+    }
+
+    internal fun stopRunning(conversationId: Uuid) = synchronized(lock) {
+        val group = agents[conversationId] ?: return@synchronized
+        val running = group.values.filter { it.run != null }
+        if (running.isEmpty()) return@synchronized
+        running.forEach {
+            group.remove(it.session.id)
+            cancel(it)
+        }
+        publish(conversationId)
+    }
+
+    fun closeConversation(conversationId: Uuid) = synchronized(lock) {
+        agents.remove(conversationId)?.values?.forEach(::cancel)
+        publish(conversationId)
+    }
+
+    private fun cancel(agent: Agent) {
+        agent.run?.let { run ->
+            agent.run = null
+            val stopped = agent.snapshot.copy(status = SubagentStatus.CLOSED, outcome = "cancelled")
+            run.result = stopped
+            run.completion.complete(stopped)
+            run.job.cancel()
         }
     }
 
-    internal suspend fun close(id: String): String? {
-        val session = sessions[id] ?: return null
-        val previous = session.mutex.withLock { session.status.wire }
-        session.job?.cancel()
-        session.mutex.withLock {
-            session.status = SubagentStatus.CLOSED
-            session.outcome = "cancelled"
-        }
-        return previous
-    }
-
-    /** 会话被删除时终止它名下的全部子代理 */
-    fun closeConversation(conversationId: Uuid) {
-        sessions.values
-            .filter { it.conversationId == conversationId }
-            .forEach { session ->
-                session.job?.cancel()
-                session.status = SubagentStatus.CLOSED
-                sessions.remove(session.id)
-            }
-    }
-
-    private fun startRun(session: SubagentSession) {
-        session.status = SubagentStatus.RUNNING
-        session.outcome = "running"
-        session.startedAt = System.currentTimeMillis()
-        session.completion = CompletableDeferred()
-        session.job = scope.launch { runSession(session) }
-    }
-
-    private suspend fun runSession(session: SubagentSession) {
-        var finalMessage: UIMessage? = null
-        var finishReason: AgentFinishReason? = null
-        var timedOut = false
-        var budgetExceeded = false
-        var failure: Exception? = null
-        var cancelled = false
-        val request = AgentRequest(
-            provider = session.provider,
-            providerSetting = session.providerSetting,
-            messages = session.messages,
-            tools = session.tools,
-            stream = false,
-            maxSteps = session.maxSteps,
-            retry = session.retry,
-        )
-        val hooks = object : AgentHooks {
-            override suspend fun prepareStep(messages: List<UIMessage>) =
-                StepRequest(messages, session.params)
-
-            // 主代理发来的消息在下一步请求模型前追加到消息末尾, 模型看到后就能改方向
-            override suspend fun pendingParts(): List<UIMessagePart> {
-                val parts = mutableListOf<UIMessagePart>()
-                while (true) {
-                    parts += session.mailbox.tryReceive().getOrNull() ?: break
-                }
-                return parts
-            }
-        }
-        try {
-            withTimeout(session.timeoutSeconds * 1_000L) {
-                runAgent(request, hooks).flowOn(Dispatchers.IO).collect { event ->
-                    when (event) {
-                        is AgentEvent.MessageUpdated -> {
-                            finalMessage = event.message
-                            session.tokens = maxOf(session.tokens, event.message.tokenCount())
-                            if (session.tokens > session.maxTotalTokens) {
-                                throw SubagentTokenBudgetExceededException()
-                            }
-                        }
-
-                        is AgentEvent.Finished -> {
-                            // 已经结束的运行不再检查预算: 最后一步的回复本身就是结果
-                            finalMessage = event.message
-                            finishReason = event.reason
-                            session.tokens = maxOf(session.tokens, event.message.tokenCount())
-                        }
-
-                        is AgentEvent.Retrying -> Unit
-                    }
-                }
-            }
-        } catch (e: SubagentTokenBudgetExceededException) {
-            budgetExceeded = true
-        } catch (e: TimeoutCancellationException) {
-            timedOut = true
-        } catch (e: CancellationException) {
-            // 被 close 或会话删除取消: 先把状态收好, 再把取消向上传
-            cancelled = true
-            throw e
-        } catch (e: Exception) {
-            failure = e
-        } finally {
-            val outcome = when {
-                cancelled -> "cancelled"
-                timedOut -> "timeout"
-                budgetExceeded -> "token_limit_reached"
-                failure != null -> "failed"
-                finishReason == AgentFinishReason.StepLimitReached -> "step_limit_reached"
-                else -> "completed"
-            }
-            // 取消后普通挂起函数会立刻抛出, 收尾必须放在 NonCancellable 里
-            withContext(NonCancellable) {
-                session.mutex.withLock {
-                    finalMessage?.takeIf { it.role == MessageRole.ASSISTANT }?.let { message ->
-                        session.messages = session.messages + message
-                    }
-                    session.report = finalMessage?.subagentReport().orEmpty()
-                    finalMessage?.stepCount?.let { session.steps = it }
-                    if (session.status != SubagentStatus.CLOSED) {
-                        session.status = if (cancelled) SubagentStatus.CLOSED else SubagentStatus.IDLE
-                    }
-                    session.outcome = outcome
-                    session.completion?.complete(Unit)
-                    session.completion = null
-                }
-                if (!cancelled) notifyFinished(session)
-            }
-        }
-    }
-
-    private fun notifyFinished(session: SubagentSession) {
-        val report = session.report
-        val preview = report.take(NOTICE_PREVIEW_CHARS).ifBlank { "(no report)" }
-        val suffix = if (report.length > NOTICE_PREVIEW_CHARS) {
-            "\n\nCall subagent_wait with agent_id \"${session.id}\" for the full report."
+    private fun publish(conversationId: Uuid) {
+        val group = agents[conversationId]
+        snapshots.value = if (group.isNullOrEmpty()) {
+            agents.remove(conversationId)
+            snapshots.value - conversationId
         } else {
-            ""
+            snapshots.value + (conversationId to group.values.map { it.snapshot })
         }
-        val notice = UIMessagePart.Notice(
-            title = "Subagent \"${session.description}\" ${session.outcome}",
-            text = preview + suffix,
-        )
-        val emitted = _noticeEvents.tryEmit(
-            SubagentNoticeEvent.Posted(
-                conversationId = session.conversationId,
-                key = "subagent-${session.id}",
-                notice = notice,
+    }
+
+    private fun startRun(agent: Agent) {
+        val session = agent.session
+        val run = Run()
+        val initialHistory = agent.history
+        agent.snapshot = SubagentSnapshot(session.id, session.description)
+        agent.run = run
+        run.job = scope.launch(start = CoroutineStart.LAZY) {
+            val leaseId = Uuid.random()
+            val acquired = context?.let {
+                ChatGenerationForegroundService.acquire(it, leaseId, session.conversationId, SessionActivity.Generating)
+            } == true
+            try {
+                var history = initialHistory
+                while (true) {
+                    val result = runSubagentTurn(
+                        request = AgentRequest(
+                            provider = session.provider,
+                            providerSetting = session.providerSetting,
+                            messages = history,
+                            tools = session.tools,
+                            stream = false,
+                            maxSteps = session.maxSteps - run.steps,
+                            retry = session.retry,
+                        ),
+                        params = session.params,
+                        timeoutMillis = run.remainingMillis(session),
+                        maxTotalTokens = session.maxTotalTokens - run.tokens,
+                        takePendingParts = { takePendingParts(agent, run) },
+                    )
+                    history = finishTurn(agent, run, history, result) ?: break
+                }
+            } finally {
+                if (acquired) context?.let { ChatGenerationForegroundService.release(it, leaseId) }
+            }
+        }
+        run.job.invokeOnCompletion { cause ->
+            if (cause == null) return@invokeOnCompletion
+            synchronized(lock) {
+                if (agent.run !== run) return@synchronized
+                finishTurn(agent, run, agent.history, SubagentRunResult(null, "failed", 0, cause.message))
+            }
+        }
+        run.job.start()
+    }
+
+    private fun takePendingParts(agent: Agent, run: Run): List<UIMessagePart> = synchronized(lock) {
+        if (agent.run !== run || agent.mailbox.isEmpty()) return@synchronized emptyList()
+        listOf(UIMessagePart.Notice("Message from the main agent", takeInstructions(agent)))
+    }
+
+    private fun takeInstructions(agent: Agent): String =
+        agent.mailbox.joinToString("\n\n").also { agent.mailbox.clear() }
+
+    private fun finishTurn(
+        agent: Agent,
+        run: Run,
+        history: List<UIMessage>,
+        result: SubagentRunResult,
+    ): List<UIMessage>? {
+        val session = agent.session
+        val message = result.message?.let { message ->
+            // A cancelled or budget-limited batch can contain tool calls without results.
+            val reusable = message.parts.filterNot { it is UIMessagePart.Tool && !it.isExecuted }
+            reusable.takeIf { it.isNotEmpty() }?.let { message.copy(parts = it) }
+        }
+        val updatedHistory = if (message == null) history else history + message
+        val report = result.report
+        return synchronized(lock) {
+            if (agent.run !== run) return@synchronized null
+            agent.history = updatedHistory
+            run.steps += result.steps
+            run.tokens += result.tokens
+            val pendingCount = agent.mailbox.size
+            // Messages arriving during the final request can use what is left of this run's budget.
+            val outcome = if (result.outcome == "completed" && pendingCount > 0) {
+                when {
+                    run.remainingMillis(session) <= 0 -> "timeout"
+                    run.steps >= session.maxSteps -> "step_limit_reached"
+                    run.tokens >= session.maxTotalTokens -> "token_limit_reached"
+                    else -> {
+                        val continued = updatedHistory + UIMessage.user(takeInstructions(agent))
+                        agent.history = continued
+                        return@synchronized continued
+                    }
+                }
+            } else {
+                result.outcome
+            }
+            agent.mailbox.clear()
+            val done = SubagentSnapshot(
+                id = session.id,
+                description = session.description,
+                status = SubagentStatus.IDLE,
+                outcome = outcome,
+                report = report,
+                steps = run.steps,
+                tokens = run.tokens,
             )
-        )
-        if (!emitted) Log.w(TAG, "notifyFinished: dropped notice for ${session.id}")
+            agent.snapshot = done
+            agent.run = null
+            publish(session.conversationId)
+            run.result = done
+            run.completion.complete(done)
+            notices.trySend(
+                SubagentNoticeEvent(
+                    conversationId = session.conversationId,
+                    key = "subagent-${session.id}",
+                    notice = UIMessagePart.Notice(
+                        title = "Subagent \"${session.description}\" ${done.outcome}",
+                        text = buildString {
+                            appendLine("Subagent \"${session.description}\" (${session.id}): ${done.outcome}.")
+                            appendLine(report.take(NOTICE_PREVIEW_CHARS).ifBlank { "(no report)" })
+                            if (report.length > NOTICE_PREVIEW_CHARS) appendLine("Use subagent_wait for the full report.")
+                            if (pendingCount > 0) appendLine("$pendingCount queued message(s) were not delivered.")
+                        },
+                        metadata = if (report.length > NOTICE_PREVIEW_CHARS) {
+                            buildJsonObject { put(SUBAGENT_REPORT_KEY, report) }
+                        } else {
+                            null
+                        },
+                    ),
+                ),
+            )
+            null
+        }
     }
 }

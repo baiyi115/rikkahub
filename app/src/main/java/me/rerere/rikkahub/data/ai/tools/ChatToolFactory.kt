@@ -2,6 +2,8 @@ package me.rerere.rikkahub.data.ai.tools
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.jsonObject
 import me.rerere.ai.core.Tool
 import me.rerere.ai.provider.BuiltInTools
@@ -23,6 +25,8 @@ import me.rerere.rikkahub.data.skills.SkillManager
 import me.rerere.rikkahub.service.BackgroundShellManager
 import me.rerere.workspace.WorkspaceShellStatus
 import java.io.File
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 import kotlin.uuid.Uuid
 
 private const val TAG = "ChatToolFactory"
@@ -32,6 +36,17 @@ private const val TOOL_OUTPUT_PREVIEW_CHARS = 4 * 1024
 // 子代理没有可读的 /tool_outputs 路径，嵌套工具直接截断，避免大文件撑爆上下文
 private const val SUBAGENT_MAX_TOOL_OUTPUT_CHARS = 16 * 1024
 private const val SUBAGENT_TOOL_OUTPUT_PREVIEW_CHARS = 4 * 1024
+
+private val WORKSPACE_PAGED_READ_TOOLS = setOf("workspace_read_file", "workspace_read_document")
+
+private object SubagentWorkspaceRead : AbstractCoroutineContextElement(SubagentWorkspaceRead.Key) {
+    object Key : CoroutineContext.Key<SubagentWorkspaceRead>
+}
+
+// Page builders need the same limit that the generic output wrapper will check.
+internal suspend fun workspaceReadOutputLimit(): Int =
+    if (currentCoroutineContext()[SubagentWorkspaceRead.Key] != null) SUBAGENT_MAX_TOOL_OUTPUT_CHARS
+    else MAX_TOOL_OUTPUT_CHARS
 
 // 搜索结果的体积由用户设置的结果数决定，且结果列表 UI 与引用跳转都依赖完整的 JSON 结构，不参与截断
 private val TOOLS_WITHOUT_OUTPUT_TRUNCATION = setOf("search_web")
@@ -203,7 +218,11 @@ class ChatToolFactory(
         if (tool.name in TOOLS_WITHOUT_OUTPUT_TRUNCATION) return tool
         val execute = tool.execute
         return tool.copy(execute = { args ->
-            val output = execute(args)
+            val output = if (tool.name in WORKSPACE_PAGED_READ_TOOLS) {
+                withContext(SubagentWorkspaceRead) { execute(args) }
+            } else {
+                execute(args)
+            }
             val textParts = output.filterIsInstance<UIMessagePart.Text>()
             val totalChars = textParts.sumOf { it.text.length }
             if (totalChars <= SUBAGENT_MAX_TOOL_OUTPUT_CHARS) {

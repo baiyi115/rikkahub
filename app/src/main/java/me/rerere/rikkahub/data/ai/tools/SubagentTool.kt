@@ -2,9 +2,9 @@ package me.rerere.rikkahub.data.ai.tools
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.flow.flowOn
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
@@ -19,6 +19,7 @@ import me.rerere.ai.agent.AgentFinishReason
 import me.rerere.ai.agent.AgentHooks
 import me.rerere.ai.agent.AgentRequest
 import me.rerere.ai.agent.StepRequest
+import me.rerere.ai.agent.expandNotices
 import me.rerere.ai.agent.runAgent
 import me.rerere.ai.core.InputSchema
 import me.rerere.ai.core.Tool
@@ -46,7 +47,7 @@ private const val SUBAGENT_DEFAULT_TOKEN_BUDGET = 1_000_000
 private const val SUBAGENT_MAX_TOKEN_BUDGET = 4_000_000
 private const val SUBAGENT_MAX_TASK_CHARS = 16_000
 
-internal class SubagentTokenBudgetExceededException :
+private class SubagentTokenBudgetExceededException :
     RuntimeException("Subagent token budget exceeded")
 
 /** 子代理默认只读: 写文件和其它有副作用的工具需要主代理显式允许 */
@@ -309,10 +310,6 @@ internal fun createSubagentTool(
                 ?: task.lineSequence().first().take(60)
 
             if (background) {
-                val live = manager.liveCount(conversationId)
-                if (live >= SUBAGENT_MAX_LIVE) {
-                    error("too many live subagents ($live); close one with subagent_close first")
-                }
                 val session = SubagentSession(
                     id = Uuid.random().toString(),
                     conversationId = conversationId,
@@ -356,106 +353,93 @@ internal fun createSubagentTool(
     )
 }
 
-/**
- * 同步跑一次子代理并组装结果。
- *
- * 后台模式由 [SubagentManager] 负责同样的运行, 这里只服务默认的同步调用。
- */
+internal data class SubagentRunResult(
+    val message: UIMessage?,
+    val outcome: String,
+    val tokens: Int,
+    val error: String? = null,
+) {
+    val steps: Int get() = message?.stepCount ?: 0
+    val report: String get() = message?.subagentReport().orEmpty().ifBlank { error.orEmpty() }
+}
+
+/** 前后台共用同一轮执行逻辑，统计只属于本轮。 */
+internal suspend fun runSubagentTurn(
+    request: AgentRequest,
+    params: TextGenerationParams,
+    timeoutMillis: Long,
+    maxTotalTokens: Int,
+    takePendingParts: () -> List<UIMessagePart> = { emptyList() },
+): SubagentRunResult = withContext(Dispatchers.IO) {
+    var message: UIMessage? = null
+    var reason: AgentFinishReason? = null
+    var tokens = 0
+    var failure: String? = null
+    val hooks = object : AgentHooks {
+        override suspend fun prepareStep(messages: List<UIMessage>) = StepRequest(messages.expandNotices(), params)
+        override suspend fun pendingParts() = takePendingParts()
+    }
+    val outcome = try {
+        val finished = withTimeoutOrNull(timeoutMillis) {
+            runAgent(request, hooks).collect { event ->
+                when (event) {
+                    is AgentEvent.MessageUpdated -> {
+                        message = event.message
+                        tokens = maxOf(tokens, event.message.tokenCount())
+                        if (tokens > maxTotalTokens) throw SubagentTokenBudgetExceededException()
+                    }
+                    is AgentEvent.Finished -> {
+                        message = event.message
+                        tokens = maxOf(tokens, event.message.tokenCount())
+                        reason = event.reason
+                    }
+                    is AgentEvent.Retrying -> Unit
+                }
+            }
+            true
+        }
+        when {
+            finished == null -> "timeout"
+            reason == AgentFinishReason.StepLimitReached -> "step_limit_reached"
+            else -> "completed"
+        }
+    } catch (_: SubagentTokenBudgetExceededException) {
+        "token_limit_reached"
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        ensureActive()
+        failure = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+        "failed"
+    }
+    SubagentRunResult(message, outcome, tokens, failure)
+}
+
 private suspend fun runSubagentOnce(
     request: AgentRequest,
     params: TextGenerationParams,
     timeoutSeconds: Long,
     maxTotalTokens: Int,
 ): JsonObject {
-    val hooks = object : AgentHooks {
-        override suspend fun prepareStep(messages: List<UIMessage>) = StepRequest(messages, params)
-    }
-    var finalMessage: UIMessage? = null
-    var finishReason: AgentFinishReason? = null
-    var timedOut = false
-    var budgetExceeded = false
-    var usedTokens = 0
-    var failure: Exception? = null
     val startedAt = System.currentTimeMillis()
-    try {
-        withTimeout(timeoutSeconds * 1_000L) {
-            runAgent(request, hooks).flowOn(Dispatchers.IO).collect { event ->
-                when (event) {
-                    is AgentEvent.MessageUpdated -> {
-                        finalMessage = event.message
-                        usedTokens = maxOf(usedTokens, event.message.tokenCount())
-                        if (usedTokens > maxTotalTokens) {
-                            throw SubagentTokenBudgetExceededException()
-                        }
-                    }
-
-                    is AgentEvent.Finished -> {
-                        // 已经结束的运行不再检查预算: 最后一步的回复本身就是结果
-                        finalMessage = event.message
-                        finishReason = event.reason
-                        usedTokens = maxOf(usedTokens, event.message.tokenCount())
-                    }
-
-                    is AgentEvent.Retrying -> Unit
-                }
-            }
-        }
-    } catch (e: SubagentTokenBudgetExceededException) {
-        budgetExceeded = true
-    } catch (e: TimeoutCancellationException) {
-        timedOut = true
-    } catch (e: CancellationException) {
-        // 用户停止生成时必须向上传播, 不能当成子代理失败
-        throw e
-    } catch (e: Exception) {
-        failure = e
-    }
-    val report = finalMessage?.subagentReport().orEmpty()
-    val failureMessage = failure?.let { e ->
-        e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
-    }
-    // 嵌套调用没有单独的界面, 把调用过的工具名带回主对话, 至少能看出它做了什么
-    val toolTrace = finalMessage?.getTools()?.map { tool ->
-        buildJsonObject {
-            put("tool", tool.toolName)
-            put("executed", tool.isExecuted)
-        }
-    }
+    val result = runSubagentTurn(request, params, timeoutSeconds * 1_000L, maxTotalTokens)
     return buildJsonObject {
-        put(
-            "status",
-            when {
-                timedOut -> "timeout"
-                budgetExceeded -> "token_limit_reached"
-                failureMessage != null -> "failed"
-                finishReason == AgentFinishReason.StepLimitReached -> "step_limit_reached"
-                else -> "completed"
-            }
-        )
-        put(
-            "result",
-            report.ifBlank {
-                when {
-                    timedOut -> "The subagent timed out before writing a final report."
-                    budgetExceeded ->
-                        "The subagent reached its token budget before writing a final report."
-
-                    failureMessage != null ->
-                        "The subagent failed before writing a final report: $failureMessage"
-
-                    finishReason == AgentFinishReason.StepLimitReached ->
-                        "The subagent reached its step limit before writing a final report."
-
-                    else -> "(the subagent produced no text output)"
-                }
-            }
-        )
-        failureMessage?.let { put("error", it) }
+        put("status", result.outcome)
+        put("result", result.report.ifBlank { "(the subagent produced no text output)" })
+        result.error?.let { put("error", it) }
         put("duration_ms", System.currentTimeMillis() - startedAt)
-        if (usedTokens > 0) put("tokens", usedTokens)
-        finalMessage?.stepCount?.let { put("steps", it) }
-        if (!toolTrace.isNullOrEmpty()) {
-            put("tools", buildJsonArray { toolTrace.forEach { add(it) } })
+        if (result.tokens > 0) put("tokens", result.tokens)
+        if (result.steps > 0) put("steps", result.steps)
+        val tools = result.message?.getTools().orEmpty()
+        if (tools.isNotEmpty()) {
+            put("tools", buildJsonArray {
+                tools.forEach { tool ->
+                    add(buildJsonObject {
+                        put("tool", tool.toolName)
+                        put("executed", tool.isExecuted)
+                    })
+                }
+            })
         }
     }
 }

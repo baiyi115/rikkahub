@@ -137,7 +137,7 @@ val appModule = module {
     }
 
     single {
-        SubagentManager()
+        SubagentManager(get())
     }
 
     single {

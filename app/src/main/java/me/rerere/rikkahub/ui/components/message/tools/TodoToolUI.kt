@@ -12,7 +12,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -29,7 +28,6 @@ import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.ai.tools.TODO_TOOL_NAME
 import me.rerere.rikkahub.data.ai.tools.TodoItem
 import me.rerere.rikkahub.data.ai.tools.TodoStatus
-import me.rerere.rikkahub.data.ai.tools.parseTodoItems
 
 /**
  * 任务清单: 标题显示完成进度，摘要显示当前步骤，详情列出完整计划。
@@ -41,8 +39,8 @@ object TodoToolUI : ToolUIRenderer {
 
     @Composable
     override fun title(context: ToolUIContext): String {
-        val items = rememberedItems(context)
-        if (items.isEmpty()) return stringResource(R.string.tool_ui_todo)
+        val items = context.todoItems
+        if (items.isNullOrEmpty()) return stringResource(R.string.tool_ui_todo)
         return stringResource(
             R.string.tool_ui_todo_title,
             items.count { it.status == TodoStatus.COMPLETED },
@@ -50,18 +48,18 @@ object TodoToolUI : ToolUIRenderer {
         )
     }
 
-    override fun hasSummary(context: ToolUIContext): Boolean = items(context).isNotEmpty()
+    override fun hasSummary(context: ToolUIContext): Boolean = !context.todoItems.isNullOrEmpty()
 
     @Composable
     override fun Summary(context: ToolUIContext) {
-        val items = rememberedItems(context)
-        if (items.isEmpty()) return
+        val items = context.todoItems
+        if (items.isNullOrEmpty()) return
         val current = items.firstOrNull { it.status == TodoStatus.IN_PROGRESS }
         Text(
-            text = if (current != null) {
-                stringResource(R.string.tool_ui_todo_current, current.activeForm ?: current.content)
-            } else {
-                stringResource(R.string.tool_ui_todo_all_done)
+            text = when {
+                current != null -> stringResource(R.string.tool_ui_todo_current, current.activeForm ?: current.content)
+                items.all { it.status == TodoStatus.COMPLETED } -> stringResource(R.string.tool_ui_todo_all_done)
+                else -> stringResource(R.string.tool_ui_todo_status_pending)
             },
             style = MaterialTheme.typography.bodySmall,
             maxLines = 2,
@@ -71,7 +69,11 @@ object TodoToolUI : ToolUIRenderer {
 
     @Composable
     override fun Preview(context: ToolUIContext, onDismissRequest: () -> Unit) {
-        val items = rememberedItems(context)
+        val items = context.todoItems
+        if (items == null) {
+            DefaultToolPreview(context = context)
+            return
+        }
         Column(
             modifier = Modifier
                 .fillMaxHeight(0.8f)
@@ -133,12 +135,4 @@ object TodoToolUI : ToolUIRenderer {
             )
         }
     }
-
-    private fun items(context: ToolUIContext): List<TodoItem> =
-        parseTodoItems(context.arguments).orEmpty()
-
-    // 参数不变时不必在每次重组里重新解析一遍
-    @Composable
-    private fun rememberedItems(context: ToolUIContext): List<TodoItem> =
-        remember(context.arguments) { parseTodoItems(context.arguments).orEmpty() }
 }

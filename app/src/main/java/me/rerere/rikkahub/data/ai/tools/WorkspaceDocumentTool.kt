@@ -1,9 +1,9 @@
 package me.rerere.rikkahub.data.ai.tools
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import me.rerere.ai.core.InputSchema
 import me.rerere.ai.core.Tool
@@ -40,10 +40,60 @@ internal fun documentFormatOf(path: String): DocumentFormat =
         else -> DocumentFormat.UNSUPPORTED
     }
 
-/** 长文档按字符切片返回, 让模型用 offset 继续读, 也不会一次塞满上下文 */
-internal fun documentSlice(text: String, offset: Int, maxChars: Int): String {
-    val start = offset.coerceIn(0, text.length)
-    return text.substring(start, (start + maxChars).coerceAtMost(text.length))
+/** Return the largest requested prefix that fits after JSON escaping and pagination metadata. */
+internal fun workspaceTextPage(
+    path: String,
+    text: String,
+    offset: Int,
+    maxChars: Int,
+    maxOutputChars: Int,
+    format: DocumentFormat? = null,
+): String {
+    fun beforePair(index: Int): Int =
+        if (index in 1 until text.length && text[index - 1].isHighSurrogate() && text[index].isLowSurrogate()) {
+            index - 1
+        } else {
+            index
+        }
+
+    val start = beforePair(offset.coerceIn(0, text.length))
+    fun encode(end: Int): String = buildJsonObject {
+        put("path", path)
+        format?.let { put("format", it.name.lowercase()) }
+        put("offset", start)
+        put("total_chars", text.length)
+        put("returned_chars", end - start)
+        put("truncated", end < text.length)
+        put("at_end", start == text.length)
+        if (end < text.length) put("next_offset", end)
+        if (start == text.length) {
+            put("note", "offset is at or past the end; there is nothing left to read")
+        }
+        put("text", text.substring(start, end))
+    }.toString()
+
+    // A one-unit request starting at a surrogate pair must still make progress.
+    val firstEnd = if (start == text.length) start else start + Character.charCount(text.codePointAt(start))
+    val requestedEnd = beforePair(start + minOf(maxChars, text.length - start)).coerceAtLeast(firstEnd)
+    val full = encode(requestedEnd)
+    if (full.length <= maxOutputChars) return full
+
+    var best = encode(firstEnd)
+    require(best.length <= maxOutputChars) { "Workspace read path leaves too little room for a page of text" }
+    var lower = firstEnd + 1
+    var upper = requestedEnd - 1
+    // The full candidate was already tried. All remaining candidates have continuation metadata.
+    while (lower <= upper) {
+        val mid = lower + (upper - lower) / 2
+        val candidate = encode(beforePair(mid))
+        if (candidate.length <= maxOutputChars) {
+            best = candidate
+            lower = mid + 1
+        } else {
+            upper = mid - 1
+        }
+    }
+    return best
 }
 
 /**
@@ -63,8 +113,8 @@ internal fun createReadDocumentTool(
         Read a document inside the assistant's bound workspace and return its extracted text.
         Supports PDF, DOCX (Word), PPTX (PowerPoint), XLSX/XLSM (Excel), EPUB, and plain-text formats
         such as CSV, Markdown or JSON. Paths must be absolute; use ${layout.workspaceDir} for the workspace files area.
-        Long documents are returned in slices: continue with offset while returned_chars is smaller than total_chars.
-        at_end is true once the offset reaches the end of the document; there is nothing more to read then.
+        Long documents are returned in pages. Pass next_offset as offset while truncated is true.
+        The JSON size limit can shorten a page. at_end is true if offset is at or past the end.
         Legacy binary Office files (.doc, .xls, .ppt) are not supported; ask the user to save them in the newer format.
     """.trimIndent().replace("\n", " "),
     parameters = {
@@ -73,13 +123,13 @@ internal fun createReadDocumentTool(
                 putPathProperty(layout, required = true)
                 put("offset", buildJsonObject {
                     put("type", "integer")
-                    put("description", "Start character offset in the extracted text. Defaults to 0.")
+                    put("description", "Start offset in UTF-16 code units (default 0). Offsets inside a pair round down.")
                 })
                 put("max_chars", buildJsonObject {
                     put("type", "integer")
                     put(
                         "description",
-                        "Characters to return. Default $DEFAULT_DOCUMENT_CHARS, max $MAX_DOCUMENT_CHARS."
+                        "Requested page length in UTF-16 code units. Default $DEFAULT_DOCUMENT_CHARS, max $MAX_DOCUMENT_CHARS."
                     )
                 })
             },
@@ -89,9 +139,9 @@ internal fun createReadDocumentTool(
     execute = {
         val params = it.jsonObject
         val path = params.absolutePath("path")
-        val offset = (params.string("offset")?.toIntOrNull() ?: 0).coerceAtLeast(0)
+        val offset = params.workspaceReadOffset()
         val maxChars = (params.string("max_chars")?.toIntOrNull() ?: DEFAULT_DOCUMENT_CHARS)
-            .coerceIn(256, MAX_DOCUMENT_CHARS)
+            .coerceIn(1, MAX_DOCUMENT_CHARS)
         val format = documentFormatOf(path)
         val text = when (format) {
             DocumentFormat.PDF -> readParsedDocument(workspaceRepository, workspaceId, path, tempDir, "pdf") {
@@ -123,23 +173,8 @@ internal fun createReadDocumentTool(
                 "Unsupported document format: $path. Supported: pdf, docx, pptx, xlsx, epub and plain text."
             )
         }
-        val start = offset.coerceIn(0, text.length)
-        val slice = documentSlice(text, start, maxChars)
-        val payload = buildJsonObject {
-            put("path", path)
-            put("format", format.name.lowercase())
-            put("offset", start)
-            put("total_chars", text.length)
-            put("returned_chars", slice.length)
-            put("truncated", start + slice.length < text.length)
-            // 和 workspace_read_file 一致: 越过末尾时明确说读完了
-            put("at_end", start >= text.length)
-            if (start >= text.length) {
-                put("note", "offset is at or past the end of the document; there is nothing left to read")
-            }
-            put("text", slice)
-        }
-        listOf(UIMessagePart.Text(payload.toString()))
+        val page = workspaceTextPage(path, text, offset, maxChars, workspaceReadOutputLimit(), format)
+        listOf(UIMessagePart.Text(page))
     },
 )
 
@@ -150,17 +185,17 @@ private suspend fun readParsedDocument(
     tempDir: File,
     extension: String,
     parse: (File) -> String,
-): String {
-    val size = repository.absoluteFileSize(workspaceId, path)
-    require(size <= MAX_DOCUMENT_BYTES) {
-        "Document is too large to read: $path (${size / 1024 / 1024}MB, max ${MAX_DOCUMENT_BYTES / 1024 / 1024}MB)"
+): String = withContext(Dispatchers.IO) {
+    val limitMessage = "Document is too large to read: $path (max ${MAX_DOCUMENT_BYTES / 1024 / 1024}MB)"
+    repository.resolveAbsoluteFile(workspaceId, path)?.let { file ->
+        require(file.length() <= MAX_DOCUMENT_BYTES) { limitMessage }
+        return@withContext parse(file)
     }
-    repository.resolveAbsoluteFile(workspaceId, path)?.let { return parse(it) }
 
     tempDir.mkdirs()
     val temp = File.createTempFile("rikkahub-doc-", ".$extension", tempDir)
-    return try {
-        temp.outputStream().use { repository.exportAbsoluteFile(workspaceId, path, it) }
+    try {
+        temp.outputStream().use { repository.exportBoundedRead(workspaceId, path, it, MAX_DOCUMENT_BYTES, limitMessage) }
         parse(temp)
     } finally {
         temp.delete()

@@ -36,22 +36,21 @@ class TodoToolTest {
     }
 
     @Test
-    fun `reads the active form of the current step`() {
-        val items = parseTodoItems(
-            buildJsonObject {
-                put("items", buildJsonArray {
-                    add(
-                        buildJsonObject {
-                            put("content", "run tests")
-                            put("status", "in_progress")
-                            put("active_form", "Running tests")
-                        }
-                    )
+    fun `retains the active form of the current step`() = runBlocking {
+        val arguments = buildJsonObject {
+            put("items", buildJsonArray {
+                add(buildJsonObject {
+                    put("content", "run tests")
+                    put("status", "in_progress")
+                    put("activeForm", "  Running tests  ")
                 })
-            }
-        )
+            })
+        }
+        val result = buildTodoTool().execute(arguments).single() as UIMessagePart.Text
+        val payload = JsonInstant.parseToJsonElement(result.text).jsonObject
 
-        assertEquals("Running tests", items?.single()?.activeForm)
+        assertEquals("Running tests", payload["current"]?.jsonPrimitive?.content)
+        assertEquals("Running tests", resolveTodoItems(args(), payload, result.metadata)?.single()?.activeForm)
     }
 
     @Test
@@ -77,25 +76,38 @@ class TodoToolTest {
     fun `an empty list clears the plan`() = runBlocking {
         val output = buildTodoTool().execute(args())
 
-        val payload = JsonInstant.parseToJsonElement((output.single() as UIMessagePart.Text).text).jsonObject
+        val result = output.single() as UIMessagePart.Text
+        val payload = JsonInstant.parseToJsonElement(result.text).jsonObject
         assertEquals("0", payload["total"]?.jsonPrimitive?.content)
+        assertEquals(emptyList<TodoItem>(), resolveTodoItems(args("old step" to "pending"), payload, result.metadata))
     }
 
     @Test
-    fun `only the first in progress item stays in progress`() = runBlocking {
-        val output = buildTodoTool().execute(
-            args(
-                "first" to "in_progress",
-                "second" to "in_progress",
-                "third" to "pending",
-            )
-        )
+    fun `only the first in progress item stays in progress in both result summaries and lists`() = runBlocking {
+        val arguments = args("first" to "in_progress", "second" to "active", "third" to "pending")
+        val result = buildTodoTool().execute(arguments).single() as UIMessagePart.Text
+        val payload = JsonInstant.parseToJsonElement(result.text).jsonObject
 
-        val payload = JsonInstant.parseToJsonElement((output.single() as UIMessagePart.Text).text).jsonObject
         assertEquals("1", payload["in_progress"]?.jsonPrimitive?.content)
         assertEquals("2", payload["pending"]?.jsonPrimitive?.content)
         assertEquals("first", payload["current"]?.jsonPrimitive?.content)
         assertTrue(payload["note"] != null)
+
+        val expected = listOf(
+            TodoItem("first", TodoStatus.IN_PROGRESS),
+            TodoItem("second", TodoStatus.PENDING),
+            TodoItem("third", TodoStatus.PENDING),
+        )
+        assertEquals(expected, resolveTodoItems(args(), payload, result.metadata))
+        assertEquals(expected, resolveTodoItems(arguments, payload, resultMetadata = null))
+    }
+
+    @Test
+    fun `a failed call does not display requested steps as accepted`() {
+        val arguments = args("done" to "completed")
+        val payload = buildJsonObject { put("error", "Tool execution failed") }
+
+        assertNull(resolveTodoItems(arguments, payload, resultMetadata = null))
     }
 
     @Test

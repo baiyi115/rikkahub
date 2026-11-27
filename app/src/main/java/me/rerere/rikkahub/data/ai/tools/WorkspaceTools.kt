@@ -1,5 +1,8 @@
 package me.rerere.rikkahub.data.ai.tools
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -23,6 +26,13 @@ import me.rerere.workspace.WorkspaceManager
 import org.koin.java.KoinJavaComponent.getKoin
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FilterOutputStream
+import java.io.IOException
+import java.io.OutputStream
+import java.nio.file.Files
+import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.FileTime
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.uuid.Uuid
 
 private const val SHELL_TIMEOUT_MAX_SECONDS = 600L
@@ -31,9 +41,7 @@ private const val MAX_READ_FILE_BYTES = 8L * 1024 * 1024
 // 分页读取缓存的上限: 再大的文件每次重读反而比占着内存划算
 private const val MAX_CACHED_FILE_BYTES = 2L * 1024 * 1024
 
-// 单次读取返回的字符数, 留出 JSON 字段的余量, 整段结果仍在工具输出上限之内
 private const val DEFAULT_FILE_READ_CHARS = 30_000
-private const val MIN_FILE_READ_CHARS = 256
 
 val WorkspaceToolDefaultApprovals: Map<String, Boolean> = mapOf(
     "workspace_read_file" to false,
@@ -110,45 +118,48 @@ private fun String.isImagePath(): Boolean =
 /**
  * 分页读取时同一份文件常被连续读好几次, 每次都整份读入再解码很浪费。
  *
- * 只缓存最近读过的这一份, 并用本地文件的大小和修改时间校验: shell 改过文件后缓存自然失效。
- * 拿不到本地文件的工作区 (SSH) 无法校验, 就不缓存, 宁可重读也不返回过期内容。
+ * First pages always read from the backend. Continuations can reuse one small local file
+ * if the mapping and file attributes still match. SSH has no local file to validate.
  */
 private class ReadFileCache {
-    private var path: String? = null
-    private var length: Long = 0
-    private var modified: Long = 0
-    private var text: String? = null
+    private data class Entry(val path: String, val stamp: ReadFileStamp, val text: String)
 
-    @Synchronized
-    fun get(path: String, file: File?): String? {
-        val cached = text ?: return null
-        if (file == null || path != this.path) return null
-        return cached.takeIf { file.length() == length && file.lastModified() == modified }
-    }
+    private val entry = AtomicReference<Entry?>(null)
 
-    @Synchronized
-    fun put(path: String, file: File?, text: String) {
-        // 修改时间为 0 表示文件系统给不出时间戳, 无法判断有没有过期, 这种情况下不缓存
-        val stamp = file?.lastModified() ?: 0L
-        if (file == null || stamp == 0L || file.length() > MAX_CACHED_FILE_BYTES) {
-            this.text = null
-            return
+    suspend fun load(
+        repository: WorkspaceRepository,
+        workspaceId: String,
+        path: String,
+        offset: Int,
+    ): String = withContext(Dispatchers.IO) {
+        val before = repository.readFileStamp(workspaceId, path)
+        val cached = entry.get()
+        if (cached != null && cached.path == path) {
+            if (offset > 0 && before == cached.stamp) return@withContext cached.text
+            entry.compareAndSet(cached, null)
         }
-        this.path = path
-        this.length = file.length()
-        this.modified = stamp
-        this.text = text
+        val text = repository.readTextInRootfs(workspaceId, path)
+        if (before != null && before == repository.readFileStamp(workspaceId, path)) {
+            entry.set(Entry(path, before, text))
+        }
+        text
     }
 }
 
-private suspend fun ReadFileCache.load(
-    workspaceRepository: WorkspaceRepository,
-    workspaceId: String,
-    path: String,
-): String {
-    val hostFile = workspaceRepository.resolveAbsoluteFile(workspaceId, path)
-    get(path, hostFile)?.let { return it }
-    return workspaceRepository.readTextInRootfs(workspaceId, path).also { put(path, hostFile, it) }
+private data class ReadFileStamp(val file: File, val fileKey: Any?, val length: Long, val modified: FileTime)
+
+private suspend fun WorkspaceRepository.readFileStamp(workspaceId: String, path: String): ReadFileStamp? {
+    val file = resolveAbsoluteFile(workspaceId, path) ?: return null
+    val attrs = try {
+        Files.readAttributes(file.toPath(), BasicFileAttributes::class.java)
+    } catch (_: IOException) {
+        return null
+    } catch (_: SecurityException) {
+        return null
+    }
+    val modified = attrs.lastModifiedTime()
+    if (!attrs.isRegularFile || attrs.size() > MAX_CACHED_FILE_BYTES || modified.toMillis() == 0L) return null
+    return ReadFileStamp(file, attrs.fileKey(), attrs.size(), modified)
 }
 
 private fun createReadFileTool(
@@ -164,8 +175,8 @@ private fun createReadFileTool(
             Read a file using the assistant's bound workspace Rootfs. Paths must be absolute inside Rootfs.
             Use ${layout.workspaceDir} for the workspace files area.
             Supports UTF-8 text files and image files (png, jpg, jpeg, gif, webp, bmp, svg, heic, heif, avif, ico).
-            Long files are returned in slices: continue with offset while truncated is true.
-            at_end is true once the offset reaches the end of the file; there is nothing more to read then.
+            Long files are returned in pages. Pass next_offset as offset while truncated is true.
+            The JSON size limit can shorten a page. at_end is true if offset is at or past the end.
             For PDF, DOCX, PPTX, XLSX and EPUB documents use workspace_read_document instead.
         """.trimIndent().replace("\n", " "),
         parameters = {
@@ -174,13 +185,13 @@ private fun createReadFileTool(
                     putPathProperty(layout, required = true)
                     put("offset", buildJsonObject {
                         put("type", "integer")
-                        put("description", "Start character offset in the file. Defaults to 0.")
+                        put("description", "Start offset in UTF-16 code units (default 0). Offsets inside a pair round down.")
                     })
                     put("max_chars", buildJsonObject {
                         put("type", "integer")
                         put(
                             "description",
-                            "Characters to return. Default and maximum $DEFAULT_FILE_READ_CHARS."
+                            "Requested page length in UTF-16 code units. Default and maximum $DEFAULT_FILE_READ_CHARS."
                         )
                     })
                 },
@@ -194,29 +205,12 @@ private fun createReadFileTool(
             if (path.isImagePath()) {
                 workspaceRepository.readImageInRootfs(workspaceId, path)
             } else {
-                val text = readFileCache.load(workspaceRepository, workspaceId, path)
-                val offset = (params.string("offset")?.toIntOrNull() ?: 0).coerceAtLeast(0)
+                val offset = params.workspaceReadOffset()
                 val maxChars = (params.string("max_chars")?.toIntOrNull() ?: DEFAULT_FILE_READ_CHARS)
-                    .coerceIn(MIN_FILE_READ_CHARS, DEFAULT_FILE_READ_CHARS)
-                val start = offset.coerceIn(0, text.length)
-                val slice = documentSlice(text, start, maxChars)
-                listOf(
-                    UIMessagePart.Text(
-                        buildJsonObject {
-                            put("path", path)
-                            put("offset", start)
-                            put("total_chars", text.length)
-                            put("returned_chars", slice.length)
-                            put("truncated", start + slice.length < text.length)
-                            // 越过末尾时明确告诉模型读完了, 否则它会拿着空 text 反复换 offset 重试
-                            put("at_end", start >= text.length)
-                            if (start >= text.length) {
-                                put("note", "offset is at or past the end of the file; there is nothing left to read")
-                            }
-                            put("text", slice)
-                        }.toString()
-                    )
-                )
+                    .coerceIn(1, DEFAULT_FILE_READ_CHARS)
+                val text = readFileCache.load(workspaceRepository, workspaceId, path, offset)
+                val page = workspaceTextPage(path, text, offset, maxChars, workspaceReadOutputLimit())
+                listOf(UIMessagePart.Text(page))
             }
         },
     )
@@ -510,10 +504,15 @@ private fun BackgroundShellTask.toJson(extra: JsonObjectBuilder.() -> Unit = {})
 internal fun kotlinx.serialization.json.JsonObject.string(name: String): String? =
     this[name]?.jsonPrimitive?.contentOrNull
 
+internal fun JsonObject.workspaceReadOffset(): Int =
+    (string("offset")?.toLongOrNull() ?: 0L).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+
 internal suspend fun WorkspaceRepository.readTextInRootfs(
     workspaceId: String,
     path: String,
-): String = readRootfsBuffer(workspaceId, path).toString(Charsets.UTF_8.name())
+): String = withContext(Dispatchers.IO) {
+    readRootfsBuffer(workspaceId, path).toString(Charsets.UTF_8.name())
+}
 
 /**
  * 按环境内绝对路径读入内存。路径映射交给工作区后端, 本地工作区由它统一处理
@@ -523,11 +522,38 @@ private suspend fun WorkspaceRepository.readRootfsBuffer(
     workspaceId: String,
     path: String,
 ): ByteArrayOutputStream {
-    val size = absoluteFileSize(workspaceId, path)
-    require(size <= MAX_READ_FILE_BYTES) {
-        "File is too large to read: $path (${size / 1024 / 1024}MB, max ${MAX_READ_FILE_BYTES / 1024 / 1024}MB). Use shell commands like head, tail, or grep to read parts of it."
+    val message = "File is too large to read: $path (max ${MAX_READ_FILE_BYTES / 1024 / 1024}MB). " +
+        "Use shell commands like head, tail, or grep to read parts of it."
+    return ByteArrayOutputStream().also { exportBoundedRead(workspaceId, path, it, MAX_READ_FILE_BYTES, message) }
+}
+
+/** Enforce the limit on incoming bytes, including when remote metadata is inaccurate. */
+internal suspend fun WorkspaceRepository.exportBoundedRead(
+    workspaceId: String,
+    path: String,
+    output: OutputStream,
+    maxBytes: Long,
+    limitMessage: String,
+) {
+    val bounded = object : FilterOutputStream(output) {
+        private var remaining = maxBytes
+
+        private fun reserve(byteCount: Int) {
+            if (byteCount > remaining) throw IOException(limitMessage)
+            remaining -= byteCount
+        }
+
+        override fun write(value: Int) {
+            reserve(1)
+            out.write(value)
+        }
+
+        override fun write(bytes: ByteArray, offset: Int, length: Int) {
+            reserve(length)
+            out.write(bytes, offset, length)
+        }
     }
-    return ByteArrayOutputStream(size.toInt()).also { exportAbsoluteFile(workspaceId, path, it) }
+    exportAbsoluteFile(workspaceId, path, bounded)
 }
 
 private suspend fun WorkspaceRepository.readImageInRootfs(
