@@ -76,6 +76,8 @@
   <string name="assistant_page_local_tools_ask_user_title">Ask User</string>
   <string name="assistant_page_local_tools_subagent_title">Subagent</string>
   <string name="assistant_page_local_tools_subagent_desc">Let the AI delegate independent subtasks to isolated subagents and collect their reports</string>
+  <string name="assistant_page_local_tools_todo_title">Plan Checklist</string>
+  <string name="assistant_page_local_tools_todo_desc">Let the AI keep a visible checklist for multi-step tasks and update it as it works</string>
   <string name="assistant_page_local_tools_browser_title">Agent Browser</string>
   <string name="assistant_page_local_tools_browser_desc">Read web pages in an off-screen browser, including JavaScript-rendered content, as a supplement to web search</string>
   <string name="assistant_page_local_tools_clipboard_desc">Read or write plain text from the device clipboard</string>
@@ -1278,6 +1280,14 @@
   <string name="tool_ui_subagent_tools">Tool calls</string>
   <string name="tool_ui_subagent_tool_not_executed">not executed</string>
   <string name="tool_ui_subagent_empty">No report yet</string>
+  <string name="tool_ui_todo">Plan</string>
+  <string name="tool_ui_todo_title">Plan: %1$d/%2$d done</string>
+  <string name="tool_ui_todo_current">Now: %1$s</string>
+  <string name="tool_ui_todo_all_done">All steps completed</string>
+  <string name="tool_ui_todo_empty">No steps yet</string>
+  <string name="tool_ui_todo_status_pending">Pending</string>
+  <string name="tool_ui_todo_status_in_progress">In progress</string>
+  <string name="tool_ui_todo_status_completed">Completed</string>
   <string name="tool_ui_shell_timeout">timeout</string>
   <string name="tool_ui_shell_exit">exit %s</string>
   <string name="tool_ui_speaking">Speaking: %s</string>

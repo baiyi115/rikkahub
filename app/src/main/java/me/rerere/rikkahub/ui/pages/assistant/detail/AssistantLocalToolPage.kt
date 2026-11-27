@@ -34,6 +34,7 @@ import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Bash
 import me.rerere.hugeicons.stroke.Calendar03
 import me.rerere.hugeicons.stroke.ChartLineData01
+import me.rerere.hugeicons.stroke.CheckList
 import me.rerere.hugeicons.stroke.ClipboardPaste
 import me.rerere.hugeicons.stroke.Clock01
 import me.rerere.hugeicons.stroke.GlobalSearch
@@ -278,6 +279,12 @@ private fun AssistantLocalToolContent(
                 icon = HugeIcons.UserCircle,
                 title = R.string.assistant_page_local_tools_subagent_title,
                 description = R.string.assistant_page_local_tools_subagent_desc,
+            )
+            toolItem(
+                option = LocalToolOption.Todo,
+                icon = HugeIcons.CheckList,
+                title = R.string.assistant_page_local_tools_todo_title,
+                description = R.string.assistant_page_local_tools_todo_desc,
             )
             toolItem(
                 option = LocalToolOption.Browser,

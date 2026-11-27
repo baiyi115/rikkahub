@@ -76,6 +76,8 @@
   <string name="assistant_page_local_tools_ask_user_title">询问用户</string>
   <string name="assistant_page_local_tools_subagent_title">子代理</string>
   <string name="assistant_page_local_tools_subagent_desc">让 AI 把独立子任务交给隔离上下文的子代理执行，并收集它们的结论</string>
+  <string name="assistant_page_local_tools_todo_title">计划清单</string>
+  <string name="assistant_page_local_tools_todo_desc">让 AI 为多步任务维护一份可见的清单，并在执行过程中持续更新</string>
   <string name="assistant_page_local_tools_browser_title">Agent 浏览器</string>
   <string name="assistant_page_local_tools_browser_desc">用离屏浏览器读取网页（含需要 JavaScript 渲染的内容），作为网络搜索的补充</string>
   <string name="assistant_page_local_tools_clipboard_desc">读取或写入设备剪贴板中的纯文本</string>
@@ -1253,6 +1255,14 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="tool_ui_subagent_tools">工具调用</string>
   <string name="tool_ui_subagent_tool_not_executed">未执行</string>
   <string name="tool_ui_subagent_empty">暂无报告</string>
+  <string name="tool_ui_todo">计划</string>
+  <string name="tool_ui_todo_title">计划：%1$d/%2$d 已完成</string>
+  <string name="tool_ui_todo_current">当前：%1$s</string>
+  <string name="tool_ui_todo_all_done">全部完成</string>
+  <string name="tool_ui_todo_empty">暂无步骤</string>
+  <string name="tool_ui_todo_status_pending">待办</string>
+  <string name="tool_ui_todo_status_in_progress">进行中</string>
+  <string name="tool_ui_todo_status_completed">已完成</string>
   <string name="tool_ui_shell_timeout">timeout</string>
   <string name="tool_ui_shell_exit">exit %s</string>
   <string name="tool_ui_speaking">朗读: %s</string>

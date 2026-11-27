@@ -52,4 +52,8 @@ sealed class LocalToolOption {
     @Serializable
     @SerialName("subagent")
     data object Subagent : LocalToolOption()
+
+    @Serializable
+    @SerialName("todo")
+    data object Todo : LocalToolOption()
 }

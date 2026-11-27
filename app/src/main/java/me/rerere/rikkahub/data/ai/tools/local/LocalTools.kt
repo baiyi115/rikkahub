@@ -6,6 +6,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import me.rerere.ai.core.Tool
 import me.rerere.rikkahub.data.ai.tools.AgentBrowser
+import me.rerere.rikkahub.data.ai.tools.buildTodoTool
 import me.rerere.rikkahub.data.ai.tools.createBrowserTools
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.event.AppEventBus
@@ -43,6 +44,8 @@ class LocalTools(
     val calendarCreateTool by lazy { buildCalendarCreateTool(context) }
 
     val chartDisplayTool by lazy { buildChartDisplayTool() }
+
+    val todoTool by lazy { buildTodoTool() }
 
     private val browserTools by lazy { createBrowserTools(agentBrowser) }
 
@@ -105,6 +108,9 @@ class LocalTools(
         }
         if (options.contains(LocalToolOption.ChartDisplay)) {
             tools.add(chartDisplayTool)
+        }
+        if (options.contains(LocalToolOption.Todo)) {
+            tools.add(todoTool)
         }
         if (options.contains(LocalToolOption.Browser)) {
             tools.addAll(browserTools)
